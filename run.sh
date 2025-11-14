@@ -1,0 +1,1 @@
+/home/xu/anaconda3/envs/condacommon/bin/python /home/xu/code/CS_RL_xu/get_screenshot.py view
