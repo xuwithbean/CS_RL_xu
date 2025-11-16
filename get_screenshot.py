@@ -437,7 +437,6 @@ class ScreenshotTool:
         safe_cmd = " ".join(subprocess.list2cmdline([c]) for c in cmd)
         ps_cmd = f"& {{ {safe_cmd} }}"
         try:
-            # run powershell and capture stdout (binary)
             proc = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps_cmd], capture_output=True, timeout=timeout)
             if proc.returncode != 0:
                 # 非零退出码，返回 None
