@@ -1,3 +1,4 @@
+# [x]: 完成对Windows的键盘控制操作。
 
 """WSL -> Windows 键发送工具（最小化版本）。
 
@@ -5,6 +6,34 @@
 """
 
 import subprocess
+import socket
+import time
+
+SERVER_HOST = '192.168.221.36'
+SERVER_PORT = 54321
+
+
+def _send_to_server(lines, expect_reply=False, timeout=0.2):
+    """Send one or many lines to the Windows control server. `lines` may be str or list[str].
+    Returns response text if expect_reply=True and server replies; otherwise None.
+    """
+    if isinstance(lines, str):
+        lines = [lines]
+    try:
+        with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=timeout) as s:
+            f = s.makefile('rwb')
+            for ln in lines:
+                f.write((ln + '\n').encode('utf-8'))
+            f.flush()
+            if expect_reply:
+                # read one line reply
+                resp = f.readline().decode('utf-8', errors='ignore')
+                return resp.strip()
+            return None
+    except Exception:
+        return None
+
+
 class KeySender:
     """提供按下/抬起分离的键发送器。"""
 
@@ -74,6 +103,11 @@ class KeySender:
             print(e)
             return
 
+        # try server first (faster); fall back to direct PowerShell if server not available
+        lines = [f'KEY_DOWN {vk}' for vk in vks]
+        if _send_to_server(lines) is not None:
+            return
+
         header = self._build_powershell_header()
         down_lines = '\n'.join(f'[KE.K]::keybd_event([byte]{vk},0,0,[UIntPtr]::Zero);' for vk in vks) + '\n'
         ps = header + down_lines
@@ -89,6 +123,10 @@ class KeySender:
             vks = [self._char_to_vk(k) for k in keys]
         except ValueError as e:
             print(e)
+            return
+
+        lines = [f'KEY_UP {vk}' for vk in reversed(vks)]
+        if _send_to_server(lines) is not None:
             return
 
         header = self._build_powershell_header()
@@ -108,6 +146,16 @@ class KeySender:
             vks = [self._char_to_vk(k) for k in keys]
         except ValueError as e:
             print(e)
+            return
+
+        # send sequence to server: KEY_DOWN... SLEEP hold_ms KEY_UP...
+        lines = []
+        for vk in vks:
+            lines.append(f'KEY_DOWN {vk}')
+        lines.append(f'SLEEP {int(hold_ms)}')
+        for vk in reversed(vks):
+            lines.append(f'KEY_UP {vk}')
+        if _send_to_server(lines) is not None:
             return
 
         header = self._build_powershell_header()

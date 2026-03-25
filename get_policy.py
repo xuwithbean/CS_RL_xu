@@ -1,3 +1,4 @@
+# [ ]: 当前情况下的策略获取。
 # Please install OpenAI SDK first: `pip3 install openai`
 import os
 from openai import OpenAI

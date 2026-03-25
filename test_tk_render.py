@@ -1,3 +1,4 @@
+# [x]: 流式画面传输测试。
 """
 Simple Tkinter image render test.
 

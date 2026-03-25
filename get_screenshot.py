@@ -1,3 +1,4 @@
+# [x]:将Windows的画面通过udp流式传播给WSL中的linux以便后续计算。
 """
 低延迟屏幕流（Windows -> WSL）
 本模块重构为基于实时流的方案：使用 Windows 上的 ffmpeg 抓取桌面并通过 UDP 推送，
