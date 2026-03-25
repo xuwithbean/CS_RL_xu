@@ -1,0 +1,11 @@
+# YOLO dataset config for CT/T detection
+# 类别编号约定：0->CT, 1->T
+
+path: ./visual_recognition/datasets/cs_ct_t
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: CT
+  1: T
