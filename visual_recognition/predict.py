@@ -1,10 +1,11 @@
+# [x]: 使用 yolo 对画面中的人物进行识别和位置信息判定
 """YOLO 推理脚本：显示 person + CT/T + 头部，并导出中心坐标。
 
 说明：
 - 模型仍使用 2 类检测（CT/T）。
 - 推理显示中统一主类为 person，子类为 CT 或 T。
 - 头部框使用身体框的几何比例估计（工程近似）：
-    - 头部宽度 = body_w * head_width_ratio
+    - 头部宽度 = body_w * head_width _ratio
     - 头部高度 = body_h * head_ratio
 - 输出检测结果 CSV，包含身体中心和头部中心坐标。
 """
