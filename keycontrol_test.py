@@ -1,3 +1,3 @@
-from keycontrol import KeySender
+from control import KeySender
 mykey=KeySender()
 mykey.press('w')

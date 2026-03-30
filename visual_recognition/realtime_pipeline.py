@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import subprocess
 import sys
@@ -23,7 +24,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from get_screenshot import ScreenshotTool
+from opengame import OpenGameTool
+
+
+def parse_udp_endpoint(url: str) -> tuple[str, int]:
+    """从 udp://ip:port URL 解析出 ip 与端口。"""
+    m = re.match(r"^udp://([^:/?#]+):(\d+)", (url or "").strip())
+    if not m:
+        raise ValueError(f"invalid udp endpoint: {url}")
+    return m.group(1), int(m.group(2))
 
 
 def get_args() -> argparse.Namespace:
@@ -57,6 +66,14 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--show", action="store_true", help="在检测进程内弹窗显示")
     parser.add_argument("--preview", action="store_true", help="使用 ffplay 预览带框输出流")
     parser.add_argument("--skip-win-stream", action="store_true", help="跳过 Windows 推流（当已有输入流时）")
+    parser.add_argument(
+        "--game-exe",
+        type=str,
+        default=r"E:\steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe",
+        help="Windows CS 可执行路径",
+    )
+    parser.add_argument("--window-title", type=str, default="auto", help="窗口标题（默认自动匹配）")
+    parser.add_argument("--wait-game", type=float, default=6.0, help="启动游戏后等待秒数")
     return parser.parse_args()
 
 
@@ -67,24 +84,34 @@ def get_run_cmd(cmd: list[str]) -> str:
 def main() -> int:
     args = get_args()
 
-    screenshot_tool = None
+    stream_tool = None
     preview_proc = None
 
     try:
         if not args.skip_win_stream:
-            screenshot_tool = ScreenshotTool(
-                ffmpeg_path="ffmpeg",
-                ffplay_path="ffplay",
+            try:
+                in_ip, in_port = parse_udp_endpoint(args.in_stream)
+            except ValueError as e:
+                print(f"输入流地址不合法: {e}", file=sys.stderr)
+                return 1
+
+            stream_tool = OpenGameTool(
+                game_exe=args.game_exe,
+                game_args=["-applaunch", "730"],
+                linux_ip=in_ip,
+                port=in_port,
                 framerate=int(args.framerate),
                 bitrate=str(args.bitrate),
-                ffmpeg_dest=args.in_stream,
-                ffplay_source=args.in_stream,
+                window_title=args.window_title,
+                stream_outputs=[args.in_stream],
             )
-            proc = screenshot_tool.start_stream_monitor(monitor=int(args.monitor), dest=args.in_stream, background=True)
+
+            stream_tool.open_game(wait_seconds=float(args.wait_game))
+            proc = stream_tool.start_stream(with_viewer=False)
             if proc is None:
-                print("Windows 推流启动失败。请检查 ffmpeg 与 monitor 参数。", file=sys.stderr)
+                print("Windows 推流启动失败。请检查窗口匹配与 ffmpeg。", file=sys.stderr)
                 return 1
-            print(f"[pipeline] Windows 推流已启动 -> {args.in_stream}")
+            print(f"[pipeline] Windows 推流已启动（窗口抓取）-> {args.in_stream}")
             # 给输入流一点启动时间，减少检测端首帧超时概率。
             time.sleep(0.8)
 
@@ -143,9 +170,9 @@ def main() -> int:
                 preview_proc.terminate()
             except Exception:
                 pass
-        if screenshot_tool is not None:
+        if stream_tool is not None:
             try:
-                screenshot_tool.stop_stream()
+                stream_tool.stop_stream()
                 print("[pipeline] Windows 推流已停止")
             except Exception:
                 pass

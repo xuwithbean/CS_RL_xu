@@ -1,5 +1,4 @@
-from keycontrol import KeySender
-from mousecontrol import MouseController
+from control import KeySender, MouseController
 mykey=KeySender()
 mymouse = MouseController()
 print('Starting loop. Press mouse side button 2 (XButton2 / mouse button 5) to stop.')

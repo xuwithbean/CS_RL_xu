@@ -1,4 +1,4 @@
-from mousecontrol import MouseController
+from control import MouseController
 import time
 mymouse = MouseController()
 print('Starting loop. Press mouse side button 2 (XButton2 / mouse button 5) to stop.')
