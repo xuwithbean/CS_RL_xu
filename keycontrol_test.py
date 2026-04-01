@@ -1,9 +1,9 @@
 from control import KeySender
 mykey=KeySender()
-mykey.press('f')
-mykey.press('r')
-mykey.press('f')
-mykey.press('r')
+mykey.press('w')
+mykey.press('S')
+mykey.press('a')
+mykey.press('d')
 mykey.press('f')
 mykey.press('r')
 mykey.press('f')
