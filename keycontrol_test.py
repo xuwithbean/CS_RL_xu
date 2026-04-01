@@ -1,3 +1,10 @@
 from control import KeySender
 mykey=KeySender()
-mykey.press('w')
+mykey.press('f')
+mykey.press('r')
+mykey.press('f')
+mykey.press('r')
+mykey.press('f')
+mykey.press('r')
+mykey.press('f')
+mykey.press('r')

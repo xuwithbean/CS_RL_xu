@@ -5,7 +5,7 @@ print('Starting loop. Press mouse side button 2 (XButton2 / mouse button 5) to s
 try:
     while True:
         # 合并为一次调用以减少延迟
-        mymouse.move_and_click(240, 0, button='left', hold_ms=10, inter_ms=5)
+        mymouse.click(button='left', hold_ms=1000, inter_ms=5)
         # 快速检测是否按下鼠标侧键（XBUTTON2，mouse button 5）
         if mymouse.is_button_pressed('x2'):
             print('Stop button detected; exiting.')

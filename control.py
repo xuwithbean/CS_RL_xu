@@ -20,8 +20,41 @@ import time
 from typing import Iterable, Literal, Optional
 
 
+def _detect_windows_host() -> str:
+    """在 WSL 中探测 Windows 主机地址。"""
+    # 优先使用默认路由网关（通常是 Windows 主机侧 vEthernet 地址）。
+    try:
+        p = subprocess.run(
+            ["ip", "route", "show", "default"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        for line in (p.stdout or "").splitlines():
+            parts = line.strip().split()
+            if "via" in parts:
+                idx = parts.index("via")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
+    except Exception:
+        pass
+
+    # 常见场景：/etc/resolv.conf 的 nameserver 即 Windows 主机侧地址。
+    try:
+        with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("nameserver "):
+                    parts = s.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
 def _env_host() -> str:
-    return os.getenv("CONTROL_HOST", "127.0.0.1")
+    return os.getenv("CONTROL_HOST", _detect_windows_host())
 
 
 def _env_port() -> int:
@@ -31,31 +64,71 @@ def _env_port() -> int:
         return 54321
 
 
+def _env_auto_start() -> bool:
+    return os.getenv("CONTROL_AUTO_START", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 class WinControlClient:
     """Windows 控制服务器客户端（行协议，长连接）。"""
 
-    def __init__(self, host: Optional[str] = None, port: Optional[int] = None, timeout: float = 0.05):
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        timeout: float = 0.2,
+        io_timeout: float = 3.0,
+    ):
         self.host = host or _env_host()
         self.port = int(port or _env_port())
+        # timeout 仅用于建连；命令收发超时使用 io_timeout（可按批次动态放宽）。
         self.timeout = float(timeout)
+        self.io_timeout = float(io_timeout)
+        self.auto_start_listener = _env_auto_start()
         self._sock: Optional[socket.socket] = None
         self._rw = None
         self._lock = threading.Lock()
+        self._autostart_attempted = False
+
+    def _estimate_batch_timeout(self, cmd_lines: list[str]) -> float:
+        """按命令内容估算本批次最短等待时间，避免长按/显式 SLEEP 触发误超时。"""
+        extra_sec = 0.0
+        for ln in cmd_lines:
+            parts = ln.strip().split()
+            if not parts:
+                continue
+            op = parts[0].upper()
+            if op == "SLEEP" and len(parts) >= 2:
+                try:
+                    extra_sec += max(0.0, int(parts[1]) / 1000.0)
+                except Exception:
+                    pass
+            elif op == "MOUSE_CLICK" and len(parts) >= 3:
+                try:
+                    extra_sec += max(0.0, int(parts[2]) / 1000.0)
+                except Exception:
+                    pass
+
+        # 预留网络与调度抖动余量。
+        return max(self.io_timeout, 0.2 + extra_sec + 0.5)
 
     def close(self) -> None:
         with self._lock:
-            if self._rw is not None:
-                try:
-                    self._rw.close()
-                except Exception:
-                    pass
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
-            self._rw = None
-            self._sock = None
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        """关闭连接（调用方需已持有 self._lock）。"""
+        if self._rw is not None:
+            try:
+                self._rw.close()
+            except Exception:
+                pass
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        self._rw = None
+        self._sock = None
 
     def _connect_locked(self) -> None:
         if self._sock is not None and self._rw is not None:
@@ -63,6 +136,10 @@ class WinControlClient:
         s = socket.create_connection((self.host, self.port), timeout=self.timeout)
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        try:
+            s.settimeout(self.io_timeout)
         except Exception:
             pass
         self._sock = s
@@ -80,10 +157,17 @@ class WinControlClient:
 
         with self._lock:
             for attempt in (1, 2):
+                sent_payload = False
                 try:
                     self._connect_locked()
+                    try:
+                        # 按批次动态放宽 I/O 超时，防止长按点击、批量 sleep 时被误判失败。
+                        self._sock.settimeout(self._estimate_batch_timeout(cmd_lines))
+                    except Exception:
+                        pass
                     for ln in cmd_lines:
                         self._rw.write((ln + "\n").encode("utf-8"))
+                    sent_payload = True
                     self._rw.flush()
 
                     last = None
@@ -91,14 +175,49 @@ class WinControlClient:
                         resp = self._rw.readline().decode("utf-8", errors="ignore").strip()
                         last = resp
                     return last if expect_reply else None
+                except ConnectionRefusedError:
+                    # 监听器未启动时快速失败，并给出明确提示。
+                    self._close_locked()
+                    can_autostart = (
+                        attempt == 1
+                        and self.auto_start_listener
+                        and not self._autostart_attempted
+                    )
+                    if can_autostart:
+                        self._autostart_attempted = True
+                        try:
+                            print("[control] listener not running, auto starting...")
+                            start_server(port=self.port, wait_ready=5.0)
+                            continue
+                        except Exception as e:
+                            print(f"[control] auto start listener failed: {e}")
+
+                    if attempt == 2:
+                        print("[control] connection refused: Windows control listener is not running.")
+                        print("[control] start it via: python control.py")
+                        return None
                 except Exception:
-                    self.close()
+                    self._close_locked()
+                    # 关键：如果已经开始发送，不能整批重试，否则会产生重复命令并打乱时序。
+                    if sent_payload:
+                        return None
                     if attempt == 2:
                         return None
         return None
 
     def send(self, line: str, expect_reply: bool = False) -> Optional[str]:
         return self.send_lines([line], expect_reply=expect_reply)
+
+
+_SHARED_CLIENT: Optional[WinControlClient] = None
+
+
+def get_shared_client() -> WinControlClient:
+    """返回模块级共享客户端，降低多对象间的连接与握手开销。"""
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None:
+        _SHARED_CLIENT = WinControlClient()
+    return _SHARED_CLIENT
 
 
 VK_MAP = {
@@ -142,7 +261,7 @@ class KeySender:
 
     def __init__(self, default_hold_ms: int = 50, client: Optional[WinControlClient] = None):
         self.default_hold_ms = int(default_hold_ms)
-        self.client = client or WinControlClient()
+        self.client = client or get_shared_client()
 
     def press(self, key: str | list[str] | tuple[str, ...]) -> None:
         vks = [_char_to_vk(k) for k in _normalize_keys(key)]
@@ -167,14 +286,26 @@ class MouseController:
 
     def __init__(self, default_hold_ms: int = 50, client: Optional[WinControlClient] = None):
         self.default_hold_ms = int(default_hold_ms)
-        self.client = client or WinControlClient()
+        self.client = client or get_shared_client()
 
     def move(self, dx: int, dy: int) -> None:
         self.client.send(f"MOUSE_MOVE {int(dx)} {int(dy)}")
 
-    def click(self, button: Literal["left", "right", "middle"] = "left", hold_ms: int | None = None) -> None:
+    def click(
+        self,
+        button: Literal["left", "right", "middle"] = "left",
+        hold_ms: int | None = None,
+        inter_ms: int = 0,
+    ) -> None:
         if hold_ms is None:
             hold_ms = self.default_hold_ms
+        # 支持点击前短暂停顿，便于与移动等动作衔接。
+        if inter_ms and int(inter_ms) > 0:
+            self.client.send_lines([
+                f"SLEEP {int(inter_ms)}",
+                f"MOUSE_CLICK {button} {int(hold_ms)}",
+            ])
+            return
         self.client.send(f"MOUSE_CLICK {button} {int(hold_ms)}")
 
     def move_and_click(
@@ -212,8 +343,18 @@ class MouseController:
         return bool(resp and resp.startswith("1"))
 
 
+class ControlSession:
+    """批量动作会话：一次发送多个命令，减少命令间网络往返延迟。"""
+
+    def __init__(self, client: Optional[WinControlClient] = None):
+        self.client = client or get_shared_client()
+
+    def run(self, lines: Iterable[str]) -> None:
+        self.client.send_lines(lines)
+
+
 # 兼容旧接口
-_default_client = WinControlClient()
+_default_client = get_shared_client()
 _DEFAULT_SENDER = KeySender(client=_default_client)
 _DEFAULT_MOUSE = MouseController(client=_default_client)
 
@@ -226,8 +367,12 @@ def mouse_move(dx: int, dy: int) -> None:
     _DEFAULT_MOUSE.move(dx, dy)
 
 
-def mouse_click(button: Literal["left", "right", "middle"] = "left", hold_ms: int | None = None) -> None:
-    _DEFAULT_MOUSE.click(button, hold_ms)
+def mouse_click(
+    button: Literal["left", "right", "middle"] = "left",
+    hold_ms: int | None = None,
+    inter_ms: int = 0,
+) -> None:
+    _DEFAULT_MOUSE.click(button, hold_ms, inter_ms)
 
 
 def mouse_press(button: Literal["left", "right", "middle"] = "left") -> None:
@@ -258,7 +403,7 @@ namespace KE {
 }
 "@ -Language CSharp
 
-$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, {port})
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, {port})
 $listener.Start()
 try {
     while ($true) {
@@ -328,6 +473,17 @@ class StartWinListener:
     def __init__(self, port: Optional[int] = None, wait_ready: float = 5.0):
         self.port = int(port or _env_port())
         self.wait_ready = float(wait_ready)
+        self.host = _env_host()
+
+    def _probe_hosts(self) -> list[str]:
+        hosts = [self.host, "127.0.0.1", "localhost"]
+        uniq = []
+        seen = set()
+        for h in hosts:
+            if h and h not in seen:
+                seen.add(h)
+                uniq.append(h)
+        return uniq
 
     @staticmethod
     def _encode_powershell(script: str) -> str:
@@ -346,23 +502,32 @@ class StartWinListener:
 
         deadline = time.time() + self.wait_ready
         while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
-                    return
-            except Exception:
-                time.sleep(0.05)
-        raise RuntimeError(f"Windows server not listening on 127.0.0.1:{self.port} after {self.wait_ready}s")
+            for h in self._probe_hosts():
+                try:
+                    with socket.create_connection((h, self.port), timeout=0.2):
+                        self.host = h
+                        return
+                except Exception:
+                    continue
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"Windows server not listening on hosts={self._probe_hosts()} port={self.port} after {self.wait_ready}s"
+        )
 
     def stop(self, timeout: float = 1.0) -> None:
-        try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as s:
-                s.sendall(b"SHUTDOWN\n")
-                try:
-                    s.recv(1024)
-                except Exception:
-                    pass
-        except Exception as e:
-            raise RuntimeError(f"Failed to contact server on port {self.port}: {e}")
+        last_err = None
+        for h in self._probe_hosts():
+            try:
+                with socket.create_connection((h, self.port), timeout=timeout) as s:
+                    s.sendall(b"SHUTDOWN\n")
+                    try:
+                        s.recv(1024)
+                    except Exception:
+                        pass
+                    return
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"Failed to contact server on port {self.port}: {last_err}")
 
 
 def start_server(port: Optional[int] = None, wait_ready: float = 5.0) -> None:
