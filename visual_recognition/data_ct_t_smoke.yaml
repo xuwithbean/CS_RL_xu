@@ -1,0 +1,7 @@
+# Smoke dataset config for CT/T detection
+path: ./visual_recognition/datasets/smoke_ct_t
+train: images/train
+val: images/val
+names:
+  0: CT
+  1: T
