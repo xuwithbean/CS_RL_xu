@@ -1,23 +1,22 @@
-# [x]: 使用 yolo 对画面中的人物进行识别和位置信息判定
-"""YOLO 推理脚本：显示 person + CT/T + 头部，并导出中心坐标。
-
-说明：
-- 模型仍使用 2 类检测（CT/T）。
-- 推理显示中统一主类为 person，子类为 CT 或 T。
-- 头部框使用身体框的几何比例估计（工程近似）：
-    - 头部宽度 = body_w * head_width _ratio
-    - 头部高度 = body_h * head_ratio
-- 输出检测结果 CSV，包含身体中心和头部中心坐标。
-"""
+# [x]: 使用 yolo和ocr等技术对画面中的人物进行识别和位置信息判定以及读取图片中的数字等信息
 
 from __future__ import annotations
 
 import argparse
 import csv
 import importlib
+import json
 import subprocess
 from pathlib import Path
-from typing import Any
+
+try:
+    from visual_recognition.ocrr import get_parse_roi_specs as get_parse_ocr_rois
+    from visual_recognition.ocrr import get_run_ocr_on_frame
+    from visual_recognition.yolor import get_draw_yolo_and_rows
+except Exception:
+    from ocrr import get_parse_roi_specs as get_parse_ocr_rois
+    from ocrr import get_run_ocr_on_frame
+    from yolor import get_draw_yolo_and_rows
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -42,6 +41,37 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--save-video", action="store_true", help="强制保存连续带框视频")
     parser.add_argument("--stream-fps", type=float, default=30.0, help="输出流帧率")
     parser.add_argument("--out-stream", type=str, default="", help="实时输出流地址，如 udp://127.0.0.1:2234")
+    parser.add_argument("--ocr", action="store_true", help="启用 OCR（识别血量/护甲/弹药等 HUD 文本）")
+    parser.add_argument(
+        "--ocr-engine",
+        type=str,
+        default="pytesseract",
+        choices=["easyocr", "pytesseract"],
+        help="OCR 引擎：easyocr 或 pytesseract",
+    )
+    parser.add_argument(
+        "--ocr-roi",
+        action="append",
+        default=[],
+        help=(
+            "OCR 区域，格式: x,y,w,h（0~1 相对坐标，可重复传多个）。"
+            "例如左下 HUD: --ocr-roi 0.00,0.78,0.42,0.22"
+        ),
+    )
+    parser.add_argument(
+        "--ocr-whitelist",
+        type=str,
+        default="0123456789/%:HPARMOABULLET",
+        help="OCR 白名单字符（pytesseract 使用）",
+    )
+    parser.add_argument("--ocr-min-conf", type=float, default=0.20, help="OCR 最低置信度（easyocr 使用）")
+    parser.add_argument(
+        "--ocr-info-jsonl",
+        type=str,
+        default="",
+        help="按帧输出 OCR 信息的 JSONL 文件路径（默认输出到运行目录）",
+    )
+    parser.add_argument("--print-ocr", action="store_true", help="实时打印每帧 OCR 信息")
     return parser.parse_args()
 
 
@@ -65,48 +95,6 @@ def get_output_dir(project: str, name: str) -> Path:
     out_dir = Path(project) / name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
-
-
-def get_class_name(names: Any, cls_idx: int) -> str:
-    if isinstance(names, dict):
-        return str(names.get(cls_idx, cls_idx))
-    if isinstance(names, list):
-        if 0 <= cls_idx < len(names):
-            return str(names[cls_idx])
-    return str(cls_idx)
-
-
-def get_color(sub_type: str) -> tuple[int, int, int]:
-    # BGR
-    if sub_type.upper() == "CT":
-        return (255, 120, 40)
-    if sub_type.upper() == "T":
-        return (40, 180, 255)
-    return (0, 255, 0)
-
-
-def get_clip(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def get_head_box(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    head_ratio: float,
-    head_width_ratio: float,
-) -> tuple[float, float, float, float]:
-    body_w = max(1.0, x2 - x1)
-    body_h = max(1.0, y2 - y1)
-    cx = x1 + body_w * 0.5
-    head_w = body_w * head_width_ratio
-    head_h = body_h * head_ratio
-    hx1 = cx - head_w * 0.5
-    hy1 = y1
-    hx2 = cx + head_w * 0.5
-    hy2 = y1 + head_h
-    return hx1, hy1, hx2, hy2
 
 
 def get_start_ffmpeg_stream_writer(
@@ -160,15 +148,39 @@ def main() -> None:
     except ImportError as exc:
         raise ImportError("未安装 opencv-python。请先执行: pip install opencv-python") from exc
 
+    ocr_obj = None
+    ocr_rois = get_parse_ocr_rois(args.ocr_roi)
+    if args.ocr:
+        if args.ocr_engine == "easyocr":
+            try:
+                easyocr = importlib.import_module("easyocr")
+            except ImportError as exc:
+                raise ImportError("未安装 easyocr。请先执行: pip install easyocr") from exc
+            ocr_obj = easyocr.Reader(["en"], gpu=(str(args.device).lower() != "cpu"))
+        else:
+            try:
+                ocr_obj = importlib.import_module("pytesseract")
+            except ImportError as exc:
+                raise ImportError("未安装 pytesseract。请先执行: pip install pytesseract") from exc
+
     model = YOLO(args.weights)
 
     out_dir = get_output_dir(args.project, args.name)
     csv_path = out_dir / "detections_centers.csv"
+    ocr_csv_path = out_dir / "ocr_hud.csv"
     is_video_like = get_is_video_like(args.source)
     is_stream_like = get_is_stream_like(args.source)
+
+    # 流输入场景默认输出 YOLO 带框流，便于下游直接消费。
+    if is_stream_like and not args.out_stream:
+        args.out_stream = "udp://127.0.0.1:2234"
+        print(f"[predict] 检测到流输入，自动启用 out-stream: {args.out_stream}")
+
     should_write_video = bool(args.save_video or is_video_like or is_stream_like)
     video_writer = None
     ffmpeg_stream_proc = None
+
+    ocr_jsonl_path = Path(args.ocr_info_jsonl) if args.ocr_info_jsonl else (out_dir / "ocr_info.jsonl")
 
     results = model.predict(
         source=args.source,
@@ -205,138 +217,131 @@ def main() -> None:
             ]
         )
 
-        frame_id = 0
-        for result in results:
-            frame_id += 1
-            img = result.orig_img.copy()
-            h_img, w_img = img.shape[:2]
-            src_path = str(result.path)
+        with ocr_csv_path.open("w", newline="", encoding="utf-8") as f_ocr:
+            ocr_jsonl = ocr_jsonl_path.open("w", encoding="utf-8") if args.ocr else None
+            ocr_writer = csv.writer(f_ocr)
+            ocr_writer.writerow(["source", "frame_id", "roi_id", "raw_text", "numbers", "hp_guess"])
 
-            if should_write_video:
-                if video_writer is None:
-                    # MKV 在长时间运行中更稳，更适合边写边看。
-                    out_video = out_dir / "predicted_realtime.mkv"
-                    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-                    video_writer = cv2.VideoWriter(str(out_video), fourcc, float(args.fps), (w_img, h_img))
+            frame_id = 0
+            for result in results:
+                frame_id += 1
+                img = result.orig_img.copy()
+                h_img, w_img = img.shape[:2]
+                src_path = str(result.path)
 
-            if args.out_stream and ffmpeg_stream_proc is None:
-                ffmpeg_stream_proc = get_start_ffmpeg_stream_writer(
-                    output_url=args.out_stream,
-                    width=w_img,
-                    height=h_img,
-                    fps=float(args.stream_fps),
+                if args.ocr and ocr_obj is not None:
+                    ocr_rows, ocr_lines = get_run_ocr_on_frame(
+                        img=img,
+                        src_path=src_path,
+                        frame_id=frame_id,
+                        rois=ocr_rois,
+                        engine=args.ocr_engine,
+                        ocr_obj=ocr_obj,
+                        min_conf=float(args.ocr_min_conf),
+                        whitelist=str(args.ocr_whitelist),
+                        cv2=cv2,
+                    )
+                    for row in ocr_rows:
+                        ocr_writer.writerow(row)
+
+                    if ocr_jsonl is not None:
+                        roi_items = []
+                        for row in ocr_rows:
+                            num_values = []
+                            nums_str = str(row[4] or "")
+                            if nums_str:
+                                for n in nums_str.split("|"):
+                                    if n.strip():
+                                        try:
+                                            num_values.append(int(n.strip()))
+                                        except Exception:
+                                            pass
+                            roi_items.append(
+                                {
+                                    "roi_id": int(row[2]),
+                                    "raw_text": str(row[3]),
+                                    "numbers": num_values,
+                                    "hp_guess": int(row[5]),
+                                }
+                            )
+
+                        payload = {
+                            "source": src_path,
+                            "frame_id": frame_id,
+                            "ocr": roi_items,
+                            "summary": ocr_lines,
+                        }
+                        ocr_jsonl.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                        ocr_jsonl.flush()
+
+                        if args.print_ocr:
+                            print(f"[ocr][frame {frame_id}] {payload['summary']}")
+
+                    if ocr_lines:
+                        cv2.putText(
+                            img,
+                            " | ".join(ocr_lines),
+                            (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 255),
+                            2,
+                        )
+
+                if should_write_video:
+                    if video_writer is None:
+                        # MKV 在长时间运行中更稳，更适合边写边看。
+                        out_video = out_dir / "predicted_realtime.mkv"
+                        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+                        video_writer = cv2.VideoWriter(str(out_video), fourcc, float(args.fps), (w_img, h_img))
+
+                if args.out_stream and ffmpeg_stream_proc is None:
+                    ffmpeg_stream_proc = get_start_ffmpeg_stream_writer(
+                        output_url=args.out_stream,
+                        width=w_img,
+                        height=h_img,
+                        fps=float(args.stream_fps),
+                    )
+
+                boxes = result.boxes
+                yolo_rows = get_draw_yolo_and_rows(
+                    result=result,
+                    img=img,
+                    w_img=w_img,
+                    h_img=h_img,
+                    model_names=model.names,
+                    head_ratio=float(args.head_ratio),
+                    head_width_ratio=float(args.head_width_ratio),
+                    line_width=int(args.line_width),
+                    cv2=cv2,
                 )
+                for row in yolo_rows:
+                    writer.writerow([src_path, frame_id] + row)
 
-            boxes = result.boxes
-            if boxes is not None:
-                for det_id, box in enumerate(boxes):
-                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
-                    conf = float(box.conf[0].item()) if box.conf is not None else 0.0
-                    cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
-
-                    sub_type = get_class_name(model.names, cls_idx)
-                    body_cx = (x1 + x2) * 0.5
-                    body_cy = (y1 + y2) * 0.5
-
-                    hx1, hy1, hx2, hy2 = get_head_box(
-                        x1=x1,
-                        y1=y1,
-                        x2=x2,
-                        y2=y2,
-                        head_ratio=float(args.head_ratio),
-                        head_width_ratio=float(args.head_width_ratio),
-                    )
-                    hx1 = get_clip(hx1, 0.0, w_img - 1.0)
-                    hy1 = get_clip(hy1, 0.0, h_img - 1.0)
-                    hx2 = get_clip(hx2, 0.0, w_img - 1.0)
-                    hy2 = get_clip(hy2, 0.0, h_img - 1.0)
-                    head_cx = (hx1 + hx2) * 0.5
-                    head_cy = (hy1 + hy2) * 0.5
-
-                    color = get_color(sub_type)
-                    cv2.rectangle(
-                        img,
-                        (int(x1), int(y1)),
-                        (int(x2), int(y2)),
-                        color,
-                        int(args.line_width),
-                    )
-                    cv2.rectangle(
-                        img,
-                        (int(hx1), int(hy1)),
-                        (int(hx2), int(hy2)),
-                        (0, 255, 255),
-                        int(args.line_width),
-                    )
-
-                    cv2.circle(img, (int(body_cx), int(body_cy)), 4, (0, 255, 0), -1)
-                    cv2.circle(img, (int(head_cx), int(head_cy)), 4, (255, 255, 0), -1)
-
-                    label = f"person {sub_type} {conf:.2f}"
-                    coord_text = f"B({int(body_cx)},{int(body_cy)}) H({int(head_cx)},{int(head_cy)})"
-                    cv2.putText(
-                        img,
-                        label,
-                        (int(x1), max(20, int(y1) - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        color,
-                        2,
-                    )
-                    cv2.putText(
-                        img,
-                        coord_text,
-                        (int(x1), min(h_img - 10, int(y2) + 18)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        1,
-                    )
-
-                    writer.writerow(
-                        [
-                            src_path,
-                            frame_id,
-                            det_id,
-                            "person",
-                            sub_type,
-                            f"{conf:.4f}",
-                            f"{body_cx:.2f}",
-                            f"{body_cy:.2f}",
-                            f"{head_cx:.2f}",
-                            f"{head_cy:.2f}",
-                            f"{x1:.2f}",
-                            f"{y1:.2f}",
-                            f"{x2:.2f}",
-                            f"{y2:.2f}",
-                            f"{hx1:.2f}",
-                            f"{hy1:.2f}",
-                            f"{hx2:.2f}",
-                            f"{hy2:.2f}",
-                        ]
-                    )
-
-            if should_write_video:
-                video_writer.write(img)
-            else:
-                if get_is_image_like(src_path):
-                    out_img = out_dir / Path(src_path).name
+                if should_write_video:
+                    video_writer.write(img)
                 else:
-                    out_img = out_dir / f"frame_{frame_id:06d}.jpg"
-                cv2.imwrite(str(out_img), img)
+                    if get_is_image_like(src_path):
+                        out_img = out_dir / Path(src_path).name
+                    else:
+                        out_img = out_dir / f"frame_{frame_id:06d}.jpg"
+                    cv2.imwrite(str(out_img), img)
 
-            if ffmpeg_stream_proc is not None and ffmpeg_stream_proc.stdin is not None:
-                try:
-                    ffmpeg_stream_proc.stdin.write(img.tobytes())
-                except (BrokenPipeError, OSError):
-                    # 输出端断开后不中断主检测流程。
-                    ffmpeg_stream_proc = None
+                if ffmpeg_stream_proc is not None and ffmpeg_stream_proc.stdin is not None:
+                    try:
+                        ffmpeg_stream_proc.stdin.write(img.tobytes())
+                    except (BrokenPipeError, OSError):
+                        # 输出端断开后不中断主检测流程。
+                        ffmpeg_stream_proc = None
 
-            if args.show:
-                cv2.imshow("person ct/t with head", img)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    break
+                if args.show:
+                    cv2.imshow("person ct/t with head + ocr", img)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:
+                        break
+
+            if ocr_jsonl is not None:
+                ocr_jsonl.close()
 
     if video_writer is not None:
         video_writer.release()
@@ -355,6 +360,9 @@ def main() -> None:
 
     print(f"推理完成。可视化输出目录: {out_dir}")
     print(f"中心坐标 CSV: {csv_path}")
+    if args.ocr:
+        print(f"OCR CSV: {ocr_csv_path}")
+        print(f"OCR JSONL: {ocr_jsonl_path}")
     if args.out_stream:
         print(f"实时输出流: {args.out_stream}")
 

@@ -63,6 +63,20 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="0", help="检测设备，如 0/cpu")
     parser.add_argument("--project", type=str, default="visual_recognition/runs", help="输出目录")
     parser.add_argument("--name", type=str, default="ct_t_realtime", help="输出实验名")
+    parser.add_argument("--ocr", action="store_true", help="启用 OCR（血量/护甲/弹药）")
+    parser.add_argument(
+        "--ocr-engine",
+        type=str,
+        default="pytesseract",
+        choices=["easyocr", "pytesseract"],
+        help="OCR 引擎",
+    )
+    parser.add_argument(
+        "--ocr-roi",
+        action="append",
+        default=[],
+        help="OCR 区域（相对坐标 x,y,w,h，可重复）",
+    )
     parser.add_argument("--show", action="store_true", help="在检测进程内弹窗显示")
     parser.add_argument("--preview", action="store_true", help="使用 ffplay 预览带框输出流")
     parser.add_argument("--skip-win-stream", action="store_true", help="跳过 Windows 推流（当已有输入流时）")
@@ -142,6 +156,10 @@ def main() -> int:
         ]
         if args.show:
             predict_cmd.append("--show")
+        if args.ocr:
+            predict_cmd.extend(["--ocr", "--ocr-engine", args.ocr_engine])
+            for roi in args.ocr_roi:
+                predict_cmd.extend(["--ocr-roi", roi])
 
         print(f"[pipeline] 启动检测: {get_run_cmd(predict_cmd)}")
 
