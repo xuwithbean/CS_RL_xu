@@ -105,7 +105,7 @@ class OpenGameTool:
             return
 
         if cmd == "screenshot_100":
-            self._start_batch_screenshot(total=100, interval_sec=2.0)
+            self._start_batch_screenshot(total=100, interval_sec=0.1)
             return
 
         if cmd == "p":
