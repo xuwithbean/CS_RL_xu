@@ -62,6 +62,8 @@ class OpenGameTool:
         self._cmd_queue: queue.Queue[str] = queue.Queue()
         self._cmd_stop = threading.Event()
         self._cmd_thread: Optional[threading.Thread] = None
+        self._shot_stop = threading.Event()
+        self._shot_thread: Optional[threading.Thread] = None
 
     def _command_listener(self) -> None:
         """后台读取终端命令，转发到线程安全队列。"""
@@ -102,8 +104,79 @@ class OpenGameTool:
                 print("[opengame] screenshot failed")
             return
 
+        if cmd == "screenshot_100":
+            self._start_batch_screenshot(total=100, interval_sec=2.0)
+            return
+
+        if cmd == "p":
+            self._stop_batch_screenshot(wait=False)
+            return
+
         print(f"[opengame] unknown command: {cmd}")
-        print("[opengame] supported command: screenshot")
+        print("[opengame] supported commands: screenshot | screenshot_100 | p")
+
+    def _batch_screenshot_worker(self, total: int, interval_sec: float) -> None:
+        """后台批量截图：固定间隔截图，可被停止。"""
+        print(f"[opengame] screenshot_100 started: total={total}, interval={interval_sec:.1f}s")
+        captured = 0
+        try:
+            for idx in range(1, total + 1):
+                if self._shot_stop.is_set():
+                    break
+
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                out = os.path.join("screenshots", f"screenshot_100_{idx:03d}_{ts}.jpg")
+                ok = self.capture_screenshot(out)
+                if ok:
+                    captured += 1
+                    print(f"[opengame] screenshot_100 progress: {idx}/{total}")
+                else:
+                    print(f"[opengame] screenshot_100 failed at {idx}/{total}")
+
+                if idx >= total:
+                    break
+
+                start_wait = time.monotonic()
+                while (time.monotonic() - start_wait) < interval_sec:
+                    if self._shot_stop.is_set():
+                        break
+                    time.sleep(0.1)
+                if self._shot_stop.is_set():
+                    break
+        finally:
+            stopped = self._shot_stop.is_set()
+            self._shot_stop.clear()
+            self._shot_thread = None
+            if stopped:
+                print(f"[opengame] screenshot_100 stopped by user, captured={captured}")
+            else:
+                print(f"[opengame] screenshot_100 finished, captured={captured}")
+
+    def _start_batch_screenshot(self, total: int, interval_sec: float) -> None:
+        """启动批量截图任务。"""
+        if self._shot_thread is not None and self._shot_thread.is_alive():
+            print("[opengame] screenshot_100 is already running; input 'p' to stop")
+            return
+        self._shot_stop.clear()
+        self._shot_thread = threading.Thread(
+            target=self._batch_screenshot_worker,
+            args=(int(total), float(interval_sec)),
+            daemon=True,
+        )
+        self._shot_thread.start()
+
+    def _stop_batch_screenshot(self, wait: bool = False) -> None:
+        """停止批量截图任务。"""
+        if self._shot_thread is None or not self._shot_thread.is_alive():
+            print("[opengame] no running screenshot_100 task")
+            return
+        self._shot_stop.set()
+        print("[opengame] stopping screenshot_100...")
+        if wait:
+            try:
+                self._shot_thread.join(timeout=3.0)
+            except Exception:
+                pass
 
     @staticmethod
     def _resolve_linux_ip(linux_ip: str) -> str:
@@ -690,6 +763,8 @@ if ($p) { Write-Output ('0x{0:X}' -f $p.MainWindowHandle) }
         print(f"Streaming to {self.stream_dest} (viewer={'on' if start_viewer else 'off'})")
         print("Press Ctrl+C to stop stream/viewer")
         print("Type 'screenshot' then Enter to capture one frame to ./screenshots/")
+        print("Type 'screenshot_100' then Enter to capture 100 frames every 2 seconds")
+        print("Type 'p' then Enter to stop screenshot_100")
         self._start_command_listener()
         restart_count = 0
         max_restarts = 20
@@ -725,6 +800,7 @@ if ($p) { Write-Output ('0x{0:X}' -f $p.MainWindowHandle) }
             pass
         finally:
             self._stop_command_listener()
+            self._stop_batch_screenshot(wait=True)
             self.stop_windows_viewer()
             self.stop_stream()
 
