@@ -56,6 +56,25 @@ def get_head_box(
     return hx1, hy1, hx2, hy2
 
 
+def get_parse_main_and_sub(class_name: str) -> tuple[str, str]:
+    """将类别名归一化到主类(person/head)与子类(CT/T)。"""
+    raw = str(class_name or "").strip().upper()
+    token = raw.replace("-", "_").replace(" ", "_")
+
+    if token in {"CT", "COUNTER_TERRORIST", "COUNTERTERRORIST"}:
+        return "person", "CT"
+    if token in {"T", "TERRORIST"}:
+        return "person", "T"
+
+    if token in {"CT_HEAD", "HEAD_CT", "CTHEAD"}:
+        return "head", "CT"
+    if token in {"T_HEAD", "HEAD_T", "THEAD"}:
+        return "head", "T"
+
+    # 未知类别默认按 person 显示，避免中断流程。
+    return "person", raw or "UNKNOWN"
+
+
 def get_draw_yolo_and_rows(
     *,
     result: Any,
@@ -79,18 +98,24 @@ def get_draw_yolo_and_rows(
         conf = float(box.conf[0].item()) if box.conf is not None else 0.0
         cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
 
-        sub_type = get_class_name(model_names, cls_idx)
+        class_name = get_class_name(model_names, cls_idx)
+        main_label, sub_type = get_parse_main_and_sub(class_name)
         body_cx = (x1 + x2) * 0.5
         body_cy = (y1 + y2) * 0.5
 
-        hx1, hy1, hx2, hy2 = get_head_box(
-            x1=x1,
-            y1=y1,
-            x2=x2,
-            y2=y2,
-            head_ratio=float(head_ratio),
-            head_width_ratio=float(head_width_ratio),
-        )
+        if main_label == "head":
+            # 对显式头部类别，直接使用检测框本身作为 head 信息。
+            hx1, hy1, hx2, hy2 = x1, y1, x2, y2
+        else:
+            # 两类模式下从身体框几何估计头部框。
+            hx1, hy1, hx2, hy2 = get_head_box(
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                head_ratio=float(head_ratio),
+                head_width_ratio=float(head_width_ratio),
+            )
         hx1 = get_clip(hx1, 0.0, w_img - 1.0)
         hy1 = get_clip(hy1, 0.0, h_img - 1.0)
         hx2 = get_clip(hx2, 0.0, w_img - 1.0)
@@ -117,7 +142,7 @@ def get_draw_yolo_and_rows(
         cv2.circle(img, (int(body_cx), int(body_cy)), 4, (0, 255, 0), -1)
         cv2.circle(img, (int(head_cx), int(head_cy)), 4, (255, 255, 0), -1)
 
-        label = f"person {sub_type} {conf:.2f}"
+        label = f"{main_label} {sub_type} {conf:.2f}"
         coord_text = f"B({int(body_cx)},{int(body_cy)}) H({int(head_cx)},{int(head_cy)})"
         cv2.putText(
             img,
@@ -141,7 +166,7 @@ def get_draw_yolo_and_rows(
         rows.append(
             [
                 str(det_id),
-                "person",
+                main_label,
                 sub_type,
                 f"{conf:.4f}",
                 f"{body_cx:.2f}",

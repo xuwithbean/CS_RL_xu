@@ -1,13 +1,13 @@
 # [x]: 实现并优化 yolo 检测训练。
-"""训练 YOLO 检测模型用于 CT/T 识别。
+"""训练 YOLO 检测模型用于 CT/T（可选 CT_HEAD/T_HEAD）识别。
 
 数据集需采用 YOLO 检测格式：
 - images/train, images/val, images/test（可选）
 - labels/train, labels/val, labels/test（可选）
 
 标签类别约定：
-- 0: CT
-- 1: T
+- 两类模式：0: CT, 1: T
+- 四类模式：0: CT, 1: T, 2: CT_HEAD, 3: T_HEAD
 """
 
 from __future__ import annotations
@@ -91,10 +91,13 @@ def get_check_dataset_yaml(data_yaml: Path) -> None:
 	else:
 		raise ValueError("数据集 yaml 缺少 names 字段，或格式错误。")
 
-	if ordered != ["CT", "T"]:
+	norm = [str(x).strip().upper() for x in ordered]
+	allowed_2 = ["CT", "T"]
+	allowed_4 = ["CT", "T", "CT_HEAD", "T_HEAD"]
+	if norm not in (allowed_2, allowed_4):
 		raise ValueError(
-			f"类别配置应为 ['CT', 'T']，当前为 {ordered}。\n"
-			"请确认标签编号 0->CT, 1->T。"
+			f"类别配置应为 {allowed_2} 或 {allowed_4}，当前为 {ordered}。\n"
+			"请确认标签编号：0->CT, 1->T，（可选）2->CT_HEAD, 3->T_HEAD。"
 		)
 
 
