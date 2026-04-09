@@ -1,0 +1,13 @@
+# YOLO dataset config for CT/T + head classes
+# 类别编号约定：0->CT, 1->T, 2->CT_HEAD, 3->T_HEAD
+
+path: ./visual_recognition/datasets/cs_ct_t_head
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: CT
+  1: T
+  2: CT_HEAD
+  3: T_HEAD
