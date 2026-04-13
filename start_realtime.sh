@@ -15,10 +15,14 @@ CONF="${CONF:-0.25}"
 IMGSZ="${IMGSZ:-640}"
 DEVICE="${DEVICE:-0}"
 RUN_NAME="${RUN_NAME:-ct_t_realtime}"
+DETECT_ROI="${DETECT_ROI:-0.00,0.08,1.00,0.84}"
+PRINT_YOLO="${PRINT_YOLO:-0}"
+YOLO_INFO_JSONL="${YOLO_INFO_JSONL:-}"
 
 PREVIEW_FLAG=""
 SKIP_STREAM_FLAG=""
 SHOW_FLAG=""
+PRINT_YOLO_FLAG=""
 
 if [[ "${PREVIEW:-1}" == "1" ]]; then
   PREVIEW_FLAG="--preview"
@@ -30,6 +34,15 @@ fi
 
 if [[ "${SHOW_WINDOW:-0}" == "1" ]]; then
   SHOW_FLAG="--show"
+fi
+
+if [[ "$PRINT_YOLO" == "1" ]]; then
+  PRINT_YOLO_FLAG="--print-yolo"
+fi
+
+YOLO_JSONL_ARGS=()
+if [[ -n "$YOLO_INFO_JSONL" ]]; then
+  YOLO_JSONL_ARGS=(--yolo-info-jsonl "$YOLO_INFO_JSONL")
 fi
 
 cd "$ROOT_DIR"
@@ -44,7 +57,10 @@ exec "$PYTHON_BIN" "$ROOT_DIR/visual_recognition/realtime_pipeline.py" \
   --conf "$CONF" \
   --imgsz "$IMGSZ" \
   --device "$DEVICE" \
+  --detect-roi "$DETECT_ROI" \
   --name "$RUN_NAME" \
+  $PRINT_YOLO_FLAG \
   $PREVIEW_FLAG \
   $SKIP_STREAM_FLAG \
-  $SHOW_FLAG
+  $SHOW_FLAG \
+  "${YOLO_JSONL_ARGS[@]}"

@@ -24,6 +24,9 @@ OCR_ROI="${OCR_ROI:-0.00,0.78,0.42,0.22}"
 OCR_MIN_CONF="${OCR_MIN_CONF:-0.20}"
 OCR_WHITELIST="${OCR_WHITELIST:-0123456789/%:HPARMOABULLET}"
 PRINT_OCR="${PRINT_OCR:-1}"
+DETECT_ROI="${DETECT_ROI:-0.00,0.08,1.00,0.84}"
+PRINT_YOLO="${PRINT_YOLO:-0}"
+YOLO_INFO_JSONL="${YOLO_INFO_JSONL:-}"
 OUT_STREAM="${OUT_STREAM:-}"
 OCR_INFO_JSONL="${OCR_INFO_JSONL:-}"
 
@@ -52,6 +55,7 @@ CMD=(
   --line-width "$LINE_WIDTH"
   --fps "$FPS"
   --stream-fps "$STREAM_FPS"
+  --detect-roi "$DETECT_ROI"
 )
 
 if [[ "$SHOW_WINDOW" == "1" ]]; then
@@ -72,11 +76,17 @@ fi
 if [[ "$PRINT_OCR" == "1" ]]; then
   CMD+=(--print-ocr)
 fi
+if [[ "$PRINT_YOLO" == "1" ]]; then
+  CMD+=(--print-yolo)
+fi
 if [[ -n "$OUT_STREAM" ]]; then
   CMD+=(--out-stream "$OUT_STREAM")
 fi
 if [[ -n "$OCR_INFO_JSONL" ]]; then
   CMD+=(--ocr-info-jsonl "$OCR_INFO_JSONL")
+fi
+if [[ -n "$YOLO_INFO_JSONL" ]]; then
+  CMD+=(--yolo-info-jsonl "$YOLO_INFO_JSONL")
 fi
 
 echo "[recognize] Running: ${CMD[*]}"

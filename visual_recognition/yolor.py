@@ -86,6 +86,7 @@ def get_draw_yolo_and_rows(
     head_width_ratio: float,
     line_width: int,
     cv2: Any,
+    detect_roi_abs: tuple[int, int, int, int] | None = None,
 ) -> list[list[str]]:
     """在图像上绘制检测框，并返回用于 CSV 的行。"""
     rows: list[list[str]] = []
@@ -97,6 +98,13 @@ def get_draw_yolo_and_rows(
         x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
         conf = float(box.conf[0].item()) if box.conf is not None else 0.0
         cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
+
+        if detect_roi_abs is not None:
+            rx1, ry1, rx2, ry2 = detect_roi_abs
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
+                continue
 
         class_name = get_class_name(model_names, cls_idx)
         main_label, sub_type = get_parse_main_and_sub(class_name)

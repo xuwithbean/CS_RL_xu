@@ -72,6 +72,19 @@ def get_args() -> argparse.Namespace:
         help="按帧输出 OCR 信息的 JSONL 文件路径（默认输出到运行目录）",
     )
     parser.add_argument("--print-ocr", action="store_true", help="实时打印每帧 OCR 信息")
+    parser.add_argument(
+        "--detect-roi",
+        type=str,
+        default="0.00,0.08,1.00,0.84",
+        help="YOLO 识别区域（相对坐标 x,y,w,h），用于排除 HUD 干扰",
+    )
+    parser.add_argument(
+        "--yolo-info-jsonl",
+        type=str,
+        default="",
+        help="按帧输出 YOLO 四类中心信息的 JSONL 文件路径（默认输出到运行目录）",
+    )
+    parser.add_argument("--print-yolo", action="store_true", help="实时打印每帧 YOLO 四类中心")
     return parser.parse_args()
 
 
@@ -95,6 +108,65 @@ def get_output_dir(project: str, name: str) -> Path:
     out_dir = Path(project) / name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def get_parse_single_roi(roi_spec: str) -> tuple[float, float, float, float]:
+    parts = [p.strip() for p in str(roi_spec or "").split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"invalid roi spec: {roi_spec}")
+    x, y, w, h = [float(v) for v in parts]
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0 - x, w))
+    h = max(0.0, min(1.0 - y, h))
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid roi size: {roi_spec}")
+    return x, y, w, h
+
+
+def get_roi_abs(w_img: int, h_img: int, roi_rel: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    rx, ry, rw, rh = roi_rel
+    x1 = int(rx * w_img)
+    y1 = int(ry * h_img)
+    x2 = int((rx + rw) * w_img)
+    y2 = int((ry + rh) * h_img)
+    x1 = max(0, min(w_img - 1, x1))
+    y1 = max(0, min(h_img - 1, y1))
+    x2 = max(x1 + 1, min(w_img, x2))
+    y2 = max(y1 + 1, min(h_img, y2))
+    return x1, y1, x2, y2
+
+
+def get_collect_four_class_centers(yolo_rows: list[list[str]]) -> dict[str, list[dict[str, float]]]:
+    """聚合四类中心点：CT/T/CT_HEAD/T_HEAD。"""
+    out: dict[str, list[dict[str, float]]] = {
+        "CT": [],
+        "T": [],
+        "CT_HEAD": [],
+        "T_HEAD": [],
+    }
+    for row in yolo_rows:
+        # [det_id, label, sub_type, conf, body_cx, body_cy, head_cx, head_cy, ...]
+        if len(row) < 8:
+            continue
+        label = str(row[1]).strip().lower()
+        sub = str(row[2]).strip().upper()
+        try:
+            body_cx = float(row[4])
+            body_cy = float(row[5])
+            head_cx = float(row[6])
+            head_cy = float(row[7])
+        except Exception:
+            continue
+
+        if label == "person":
+            if sub in ("CT", "T"):
+                out[sub].append({"x": body_cx, "y": body_cy})
+                out[f"{sub}_HEAD"].append({"x": head_cx, "y": head_cy})
+        elif label == "head":
+            if sub in ("CT", "T"):
+                out[f"{sub}_HEAD"].append({"x": head_cx, "y": head_cy})
+    return out
 
 
 def get_start_ffmpeg_stream_writer(
@@ -168,8 +240,11 @@ def main() -> None:
     out_dir = get_output_dir(args.project, args.name)
     csv_path = out_dir / "detections_centers.csv"
     ocr_csv_path = out_dir / "ocr_hud.csv"
+    yolo_jsonl_path = Path(args.yolo_info_jsonl) if args.yolo_info_jsonl else (out_dir / "yolo_info.jsonl")
     is_video_like = get_is_video_like(args.source)
     is_stream_like = get_is_stream_like(args.source)
+
+    detect_roi_rel = get_parse_single_roi(args.detect_roi)
 
     # 流输入场景默认输出 YOLO 带框流，便于下游直接消费。
     if is_stream_like and not args.out_stream:
@@ -218,6 +293,7 @@ def main() -> None:
         )
 
         with ocr_csv_path.open("w", newline="", encoding="utf-8") as f_ocr:
+            yolo_jsonl = yolo_jsonl_path.open("w", encoding="utf-8")
             ocr_jsonl = ocr_jsonl_path.open("w", encoding="utf-8") if args.ocr else None
             ocr_writer = csv.writer(f_ocr)
             ocr_writer.writerow(["source", "frame_id", "roi_id", "raw_text", "numbers", "hp_guess"])
@@ -228,6 +304,10 @@ def main() -> None:
                 img = result.orig_img.copy()
                 h_img, w_img = img.shape[:2]
                 src_path = str(result.path)
+                detect_roi_abs = get_roi_abs(w_img, h_img, detect_roi_rel)
+
+                drx1, dry1, drx2, dry2 = detect_roi_abs
+                cv2.rectangle(img, (drx1, dry1), (drx2, dry2), (180, 180, 0), 1)
 
                 if args.ocr and ocr_obj is not None:
                     ocr_rows, ocr_lines = get_run_ocr_on_frame(
@@ -314,9 +394,29 @@ def main() -> None:
                     head_width_ratio=float(args.head_width_ratio),
                     line_width=int(args.line_width),
                     cv2=cv2,
+                    detect_roi_abs=detect_roi_abs,
                 )
                 for row in yolo_rows:
                     writer.writerow([src_path, frame_id] + row)
+
+                four_centers = get_collect_four_class_centers(yolo_rows)
+
+                yolo_payload = {
+                    "source": src_path,
+                    "frame_id": frame_id,
+                    "centers": four_centers,
+                    "detect_roi": {
+                        "x1": int(drx1),
+                        "y1": int(dry1),
+                        "x2": int(drx2),
+                        "y2": int(dry2),
+                    },
+                }
+                yolo_jsonl.write(json.dumps(yolo_payload, ensure_ascii=False) + "\n")
+                yolo_jsonl.flush()
+
+                if args.print_yolo:
+                    print(f"[yolo][frame {frame_id}] centers={yolo_payload['centers']}")
 
                 if should_write_video:
                     video_writer.write(img)
@@ -342,6 +442,7 @@ def main() -> None:
 
             if ocr_jsonl is not None:
                 ocr_jsonl.close()
+            yolo_jsonl.close()
 
     if video_writer is not None:
         video_writer.release()
@@ -360,6 +461,7 @@ def main() -> None:
 
     print(f"推理完成。可视化输出目录: {out_dir}")
     print(f"中心坐标 CSV: {csv_path}")
+    print(f"YOLO JSONL: {yolo_jsonl_path}")
     if args.ocr:
         print(f"OCR CSV: {ocr_csv_path}")
         print(f"OCR JSONL: {ocr_jsonl_path}")

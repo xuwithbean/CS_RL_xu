@@ -63,6 +63,14 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="0", help="检测设备，如 0/cpu")
     parser.add_argument("--project", type=str, default="visual_recognition/runs", help="输出目录")
     parser.add_argument("--name", type=str, default="ct_t_realtime", help="输出实验名")
+    parser.add_argument(
+        "--detect-roi",
+        type=str,
+        default="0.00,0.08,1.00,0.84",
+        help="YOLO 识别区域（相对坐标 x,y,w,h），用于排除 HUD 干扰",
+    )
+    parser.add_argument("--print-yolo", action="store_true", help="实时打印每帧 YOLO 四类中心")
+    parser.add_argument("--yolo-info-jsonl", type=str, default="", help="YOLO 中心信息 JSONL 输出路径")
     parser.add_argument("--ocr", action="store_true", help="启用 OCR（血量/护甲/弹药）")
     parser.add_argument(
         "--ocr-engine",
@@ -149,11 +157,17 @@ def main() -> int:
             args.out_stream,
             "--stream-fps",
             str(args.framerate),
+            "--detect-roi",
+            args.detect_roi,
             "--project",
             args.project,
             "--name",
             args.name,
         ]
+        if args.print_yolo:
+            predict_cmd.append("--print-yolo")
+        if args.yolo_info_jsonl:
+            predict_cmd.extend(["--yolo-info-jsonl", args.yolo_info_jsonl])
         if args.show:
             predict_cmd.append("--show")
         if args.ocr:
