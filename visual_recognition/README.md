@@ -27,6 +27,17 @@ class_id x_center y_center width height
 
 坐标为相对值（0 到 1）。
 
+如果你希望先对截图/采集图做统一裁剪（例如裁掉 HUD），可以使用根目录脚本 [crop_images.sh](../crop_images.sh)：
+
+```bash
+INPUT=./screenshots \
+OUTPUT=./screenshots_crop \
+ROI=0.00,0.08,1.00,0.84 \
+bash crop_images.sh
+```
+
+默认会保留输入目录结构，并为输出文件添加 `_crop` 后缀。
+
 ## 3. 数据配置文件
 
 - 两类配置：[data_ct_t.yaml](data_ct_t.yaml)

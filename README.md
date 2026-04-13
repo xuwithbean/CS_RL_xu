@@ -75,6 +75,31 @@ bash ocr_pic.sh
 bash ocr_video.sh
 ```
 
+## 图片批量裁剪
+
+如果你要先把截图/采集图片统一裁掉 HUD 或边缘区域，可直接用：
+
+```bash
+bash crop_images.sh
+```
+
+常用环境变量：
+- INPUT：输入图片或目录。
+- OUTPUT：输出目录。
+- ROI：裁剪区域（相对坐标 x,y,w,h，默认 0.00,0.08,1.00,0.84）。
+- RECURSIVE=1：递归处理子目录。
+- PRESERVE_TREE=1：输出时保留目录结构。
+- SUFFIX：输出文件名后缀。
+
+示例：批量裁掉上下 HUD
+
+```bash
+INPUT=./screenshots \
+OUTPUT=./screenshots_crop \
+ROI=0.00,0.08,1.00,0.84 \
+bash crop_images.sh
+```
+
 ## run.sh 常用环境变量
 
 - GAME_EXE：Windows 游戏可执行路径。

@@ -59,14 +59,21 @@ def _env_host() -> str:
 
 def _env_port() -> int:
     try:
-        # 54321 在部分 Windows 环境可能被保留端口策略拒绝绑定；50051 也可能被其他服务占用。
-        return int(os.getenv("CONTROL_PORT", "50999"))
+        # 50999 在部分 Windows 环境会命中保留端口策略，默认改为更常用的高位端口。
+        return int(os.getenv("CONTROL_PORT", "60000"))
     except Exception:
-        return 50999
+        return 60000
 
 
 def _env_auto_start() -> bool:
     return os.getenv("CONTROL_AUTO_START", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_wait_ready() -> float:
+    try:
+        return float(os.getenv("CONTROL_WAIT_READY", "25"))
+    except Exception:
+        return 25.0
 
 
 class WinControlClient:
@@ -141,7 +148,7 @@ class WinControlClient:
                         self._autostart_attempted = True
                         print("[control] listener not ready, auto starting...")
                         try:
-                            start_server(port=self.port, wait_ready=5.0)
+                            self.port = start_server(port=self.port)
                             continue
                         except Exception as start_err:
                             print(f"[control] auto start listener failed: {start_err}")
@@ -211,7 +218,6 @@ class KeySender:
 
     def press(self, key: str | list[str] | tuple[str, ...]) -> None:
         self.press_and_release(key)
-
 
     def release(self, key: str | list[str] | tuple[str, ...]) -> None:
         vks = [_char_to_vk(k) for k in _normalize_keys(key)]
@@ -297,16 +303,6 @@ class MouseController:
         return bool(resp and resp.startswith("1"))
 
 
-class ControlSession:
-    """批量动作会话：一次发送多个命令，减少命令间网络往返延迟。"""
-
-    def __init__(self, client: Optional[WinControlClient] = None):
-        self.client = client or get_shared_client()
-
-    def run(self, lines: Iterable[str]) -> None:
-        self.client.send_lines(lines)
-
-
 # 兼容旧接口
 _default_client = get_shared_client()
 _DEFAULT_SENDER = KeySender(client=_default_client)
@@ -361,8 +357,28 @@ namespace KE {
 }
 "@ -Language CSharp
 
-$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, {port})
-$listener.Start()
+$candidatePorts = @({ports})
+$listener = $null
+$lastBindError = ''
+foreach ($candidatePort in $candidatePorts) {
+    foreach ($bindAddr in @([System.Net.IPAddress]::Any, [System.Net.IPAddress]::Loopback)) {
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new($bindAddr, [int]$candidatePort)
+            $listener.Start()
+            break
+        } catch {
+            $lastBindError = $_.Exception.Message
+            try { if ($listener -ne $null) { $listener.Stop() } } catch {}
+            $listener = $null
+        }
+    }
+    if ($listener -ne $null) {
+        break
+    }
+}
+if ($listener -eq $null) {
+    throw "Unable to bind control listener on any candidate port: $($candidatePorts -join ','); lastError=$lastBindError"
+}
 try {
     while ($true) {
         $client = $listener.AcceptTcpClient()
@@ -428,10 +444,21 @@ try {
 class StartWinListener:
     """在 WSL 中启动/停止 Windows 控制监听器。"""
 
-    def __init__(self, port: Optional[int] = None, wait_ready: float = 5.0):
+    def __init__(self, port: Optional[int] = None, wait_ready: Optional[float] = None):
         self.port = int(port or _env_port())
-        self.wait_ready = float(wait_ready)
+        self.wait_ready = float(_env_wait_ready() if wait_ready is None else wait_ready)
         self.host = _env_host()
+
+    def _candidate_ports(self) -> list[int]:
+        ports = [self.port]
+        for offset in range(1, 16):
+            ports.append(self.port + offset)
+        for offset in range(1, 6):
+            if self.port - offset > 0:
+                ports.append(self.port - offset)
+        # 增加离散备选端口，规避系统保留端口区间。
+        ports.extend([60000, 60100, 55000, 52000, 50000, 45000, 38080, 27015, 23456, 18080])
+        return list(dict.fromkeys(p for p in ports if 0 < p < 65536))
 
     def _probe_hosts(self) -> list[str]:
         hosts = [self.host, "127.0.0.1", "localhost"]
@@ -460,8 +487,9 @@ class StartWinListener:
         except Exception:
             return False
 
-    def start(self) -> None:
-        script = PS_SERVER.replace("{port}", str(self.port))
+    def start(self) -> int:
+        candidate_ports = self._candidate_ports()
+        script = PS_SERVER.replace("{ports}", ",".join(str(p) for p in candidate_ports))
         b64 = self._encode_powershell(script)
         # 直接拉起监听脚本；若启动失败可拿到 stderr 便于定位。
         proc = subprocess.Popen(
@@ -499,12 +527,14 @@ class StartWinListener:
                     raise RuntimeError(f"Windows listener process exited early (code={code}): {msg}")
                 raise RuntimeError(f"Windows listener process exited early (code={code})")
             for h in self._probe_hosts():
-                if self._is_control_server_ready(h, self.port, timeout=0.2):
-                    self.host = h
-                    return
+                for p in candidate_ports:
+                    if self._is_control_server_ready(h, p, timeout=0.2):
+                        self.host = h
+                        self.port = p
+                        return self.port
             time.sleep(0.05)
         raise RuntimeError(
-            f"Windows server not listening on hosts={self._probe_hosts()} port={self.port} after {self.wait_ready}s"
+            f"Windows server not listening on hosts={self._probe_hosts()} ports={candidate_ports} after {self.wait_ready}s"
         )
 
     def stop(self, timeout: float = 1.0) -> None:
@@ -523,8 +553,8 @@ class StartWinListener:
         raise RuntimeError(f"Failed to contact server on port {self.port}: {last_err}")
 
 
-def start_server(port: Optional[int] = None, wait_ready: float = 5.0) -> None:
-    StartWinListener(port=port, wait_ready=wait_ready).start()
+def start_server(port: Optional[int] = None, wait_ready: Optional[float] = None) -> int:
+    return StartWinListener(port=port, wait_ready=wait_ready).start()
 
 
 def stop_server(port: Optional[int] = None, timeout: float = 1.0) -> None:
@@ -534,6 +564,7 @@ def stop_server(port: Optional[int] = None, timeout: float = 1.0) -> None:
 def _main_listener_cli(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--port", "-p", type=int, default=_env_port())
+    p.add_argument("--wait-ready", type=float, default=_env_wait_ready())
     p.add_argument("--stop", action="store_true")
     args = p.parse_args(argv)
     if args.stop:
@@ -541,9 +572,9 @@ def _main_listener_cli(argv=None) -> int:
         print("Sent shutdown")
         return 0
     print("Starting Windows listener...")
-    listener = StartWinListener(port=args.port)
-    listener.start()
-    print(f"Windows listener started on {listener.host}:{args.port}")
+    listener = StartWinListener(port=args.port, wait_ready=args.wait_ready)
+    actual_port = listener.start()
+    print(f"Windows listener started on {listener.host}:{actual_port}")
     return 0
 
 
