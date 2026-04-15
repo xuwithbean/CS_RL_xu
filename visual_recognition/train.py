@@ -85,7 +85,7 @@ def get_check_dataset_yaml(data_yaml: Path) -> None:
 
 	names: Any = cfg.get("names", None)
 	if isinstance(names, dict):
-		ordered = [names[k] for k in sorted(names.keys(), key=lambda x: int(x))]
+		ordered = list(names.values())
 	elif isinstance(names, list):
 		ordered = names
 	else:
@@ -99,6 +99,21 @@ def get_check_dataset_yaml(data_yaml: Path) -> None:
 			f"类别配置应为 {allowed_2} 或 {allowed_4}，当前为 {ordered}。\n"
 			"请确认标签编号：0->CT, 1->T，（可选）2->CT_HEAD, 3->T_HEAD。"
 		)
+
+	raw_path = cfg.get("path", None)
+	if raw_path and not Path(str(raw_path)).is_absolute():
+		path_obj = Path(str(raw_path))
+		candidates = [
+			(data_yaml.parent / path_obj).resolve(),
+			(data_yaml.parent.parent / path_obj).resolve(),
+			(Path.cwd() / path_obj).resolve(),
+		]
+		if not any(p.exists() for p in candidates):
+			raise FileNotFoundError(
+				f"数据集根目录不存在: {path_obj}\n"
+				f"已尝试: {', '.join(str(p) for p in candidates)}\n"
+				"请先准备数据集目录，或在 yolorun.sh 中切换到 smoke 数据集。"
+			)
 
 
 def get_resolved_dataset_yaml(data_yaml: Path) -> Path:

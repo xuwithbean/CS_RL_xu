@@ -1,7 +1,9 @@
-# Smoke dataset config for CT/T detection
+# Smoke dataset config for 4-class CT/T/HEAD detection
 path: ./visual_recognition/datasets/smoke_ct_t
 train: images/train
 val: images/val
 names:
   0: CT
-  1: T
+  2: T
+  1: CT_HEAD
+  3: T_HEAD

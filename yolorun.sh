@@ -26,11 +26,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/xu/anaconda3/envs/condacommon/bin/python}"
 
-DATA="${DATA:-visual_recognition/data_ct_t.yaml}"
+DATA="${DATA:-visual_recognition/data_ct_t_head.yaml}"
 MODEL="${MODEL:-yolo11n.pt}"
 EPOCHS="${EPOCHS:-100}"
-IMGSZ="${IMGSZ:-640}"
-BATCH="${BATCH:-16}"
+IMGSZ="${IMGSZ:-960}"
+BATCH="${BATCH:-1}"
 DEVICE="${DEVICE:-0}"
 PROJECT="${PROJECT:-visual_recognition/runs}"
 NAME="${NAME:-ct_t_yolo}"
@@ -56,18 +56,18 @@ if [[ ! -f "$ROOT_DIR/$DATA" ]]; then
 fi
 
 # If the default full dataset is missing, fallback to smoke dataset automatically.
-DEFAULT_FULL_DATA="visual_recognition/data_ct_t.yaml"
+DEFAULT_FULL_DATA="visual_recognition/data_ct_t_head.yaml"
 DEFAULT_SMOKE_DATA="visual_recognition/data_ct_t_smoke.yaml"
-FULL_VAL_DIR="$ROOT_DIR/visual_recognition/datasets/cs_ct_t/images/val"
+FULL_DATA_DIR="$ROOT_DIR/visual_recognition/datasets/cs_ct_t_head"
 
-if [[ "$DATA" == "$DEFAULT_FULL_DATA" ]] && [[ ! -d "$FULL_VAL_DIR" ]]; then
+if [[ "$DATA" == "$DEFAULT_FULL_DATA" ]] && [[ ! -d "$FULL_DATA_DIR" ]]; then
   if [[ -f "$ROOT_DIR/$DEFAULT_SMOKE_DATA" ]]; then
-    echo "[yolorun] Full dataset not found: $FULL_VAL_DIR" >&2
+    echo "[yolorun] Full dataset not found: $FULL_DATA_DIR" >&2
     echo "[yolorun] Fallback to smoke dataset: $DEFAULT_SMOKE_DATA" >&2
     DATA="$DEFAULT_SMOKE_DATA"
   else
     echo "[yolorun] Full dataset missing and smoke yaml not found." >&2
-    echo "[yolorun] Please prepare datasets/cs_ct_t or set DATA=<your_yaml>." >&2
+    echo "[yolorun] Please prepare datasets/cs_ct_t_head or set DATA=<your_yaml>." >&2
     exit 1
   fi
 fi

@@ -8,6 +8,6 @@ test: images/test
 
 names:
   0: CT
-  1: T
-  2: CT_HEAD
+  2: T
+  1: CT_HEAD
   3: T_HEAD
