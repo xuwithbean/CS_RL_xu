@@ -1,103 +1,146 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# YOLO training launcher for CT/T detection.
-# Usage:
+# 实时识别启动器：输入流 -> YOLO -> 输出流/预览。
+# 示例：
 #   bash yolorun.sh
-# Optional overrides:
-#   PYTHON_BIN=/home/xu/anaconda3/envs/condacommon/bin/python \
-#   DATA=visual_recognition/data_ct_t.yaml \
-#   MODEL=yolo11n.pt \
-#   EPOCHS=100 \
-#   IMGSZ=640 \
-#   BATCH=16 \
-#   DEVICE=0 \
-#   PROJECT=visual_recognition/runs \
-#   NAME=ct_t_yolo \
-#   WORKERS=4 \
-#   PATIENCE=50 \
-#   SEED=42 \
-#   CACHE=false \
-#   AMP=0 \
-#   EXIST_OK=0 \
-#   FORCE_PIL_IMREAD=0 \
-#   bash yolorun.sh
+#   IN_STREAM=udp://192.168.221.1:12345 OUT_STREAM=udp://127.0.0.1:2234 bash yolorun.sh
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/xu/anaconda3/envs/condacommon/bin/python}"
 
-DATA="${DATA:-visual_recognition/data_ct_t_head.yaml}"
-MODEL="${MODEL:-yolo11n.pt}"
-EPOCHS="${EPOCHS:-100}"
-IMGSZ="${IMGSZ:-960}"
-BATCH="${BATCH:-1}"
-DEVICE="${DEVICE:-0}"
-PROJECT="${PROJECT:-visual_recognition/runs}"
-NAME="${NAME:-ct_t_yolo}"
-WORKERS="${WORKERS:-4}"
-PATIENCE="${PATIENCE:-50}"
-SEED="${SEED:-42}"
-CACHE="${CACHE:-false}"
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage:
+  bash yolorun.sh
 
-# Switch-like options: 1 enables, 0 disables.
-AMP="${AMP:-0}"
-EXIST_OK="${EXIST_OK:-0}"
-FORCE_PIL_IMREAD="${FORCE_PIL_IMREAD:-0}"
+Common overrides:
+  IN_STREAM=udp://192.168.221.1:12345
+  OUT_STREAM=udp://127.0.0.1:2234
+  WEIGHTS=/path/to/best.pt
+  DEVICE=0
+  HALF=1
+  INFER_EVERY=1
+  WORK_SIZE=704x396
+  STREAM_FPS=60
+  OUT_VCODEC=mpeg2video
+
+Examples:
+  bash yolorun.sh
+  IN_STREAM=udp://192.168.221.1:12345 PREVIEW=1 OUT_STREAM=udp://127.0.0.1:2234 bash yolorun.sh
+EOF
+  exit 0
+fi
+
+AUTO_LINUX_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+LINUX_IP="${LINUX_IP:-${AUTO_LINUX_IP:-127.0.0.1}}"
+PORT="${PORT:-12345}"
+
+IN_STREAM="${IN_STREAM:-udp://${LINUX_IP}:${PORT}}"
+OUT_STREAM="${OUT_STREAM:-}"
+
+WEIGHTS="${WEIGHTS:-}"
+CONF="${CONF:-0.30}"
+IMGSZ="${IMGSZ:-320}"
+DEVICE="${DEVICE:-0}"
+HALF="${HALF:-1}"
+INFER_EVERY="${INFER_EVERY:-1}"
+
+WORK_SIZE="${WORK_SIZE:-704x396}"
+DETECT_ROI="${DETECT_ROI:-0.00,0.08,1.00,0.84}"
+LINE_WIDTH="${LINE_WIDTH:-2}"
+STREAM_FPS="${STREAM_FPS:-60}"
+
+PREVIEW="${PREVIEW:-1}"
+SHOW_WINDOW="${SHOW_WINDOW:-0}"
+
+CAPTURE_DRAIN="${CAPTURE_DRAIN:-0}"
+CAPTURE_RECONNECT_SEC="${CAPTURE_RECONNECT_SEC:-2.0}"
+CAPTURE_TIMEOUT_MS="${CAPTURE_TIMEOUT_MS:-4000}"
+UDP_FIFO_SIZE="${UDP_FIFO_SIZE:-1048576}"
+CAPTURE_PROBESIZE="${CAPTURE_PROBESIZE:-131072}"
+CAPTURE_ANALYZEDURATION="${CAPTURE_ANALYZEDURATION:-2000000}"
+
+OUT_VCODEC="${OUT_VCODEC:-mpeg2video}"
+OUT_BITRATE="${OUT_BITRATE:-2200k}"
+FFMPEG_BIN="${FFMPEG_BIN:-ffmpeg}"
+FFPLAY_BIN="${FFPLAY_BIN:-ffplay}"
+
+DEFAULT_WEIGHTS_CANDIDATES=(
+  "$ROOT_DIR/visual_recognition/runs/xu/weights/best.pt"
+  "$ROOT_DIR/visual_recognition/runs/xu/weights/last.pt"
+  "$ROOT_DIR/yolo11n.pt"
+)
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "[yolorun] PYTHON_BIN not found or not executable: $PYTHON_BIN" >&2
-  echo "[yolorun] Hint: set PYTHON_BIN or activate conda env first." >&2
+  echo "[yolorun] PYTHON_BIN not found: $PYTHON_BIN" >&2
   exit 1
 fi
 
-if [[ ! -f "$ROOT_DIR/$DATA" ]]; then
-  echo "[yolorun] DATA yaml not found: $ROOT_DIR/$DATA" >&2
-  exit 1
+if [[ -z "$WEIGHTS" ]]; then
+  for candidate in "${DEFAULT_WEIGHTS_CANDIDATES[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      WEIGHTS="$candidate"
+      break
+    fi
+  done
 fi
 
-# If the default full dataset is missing, fallback to smoke dataset automatically.
-DEFAULT_FULL_DATA="visual_recognition/data_ct_t_head.yaml"
-DEFAULT_SMOKE_DATA="visual_recognition/data_ct_t_smoke.yaml"
-FULL_DATA_DIR="$ROOT_DIR/visual_recognition/datasets/cs_ct_t_head"
-
-if [[ "$DATA" == "$DEFAULT_FULL_DATA" ]] && [[ ! -d "$FULL_DATA_DIR" ]]; then
-  if [[ -f "$ROOT_DIR/$DEFAULT_SMOKE_DATA" ]]; then
-    echo "[yolorun] Full dataset not found: $FULL_DATA_DIR" >&2
-    echo "[yolorun] Fallback to smoke dataset: $DEFAULT_SMOKE_DATA" >&2
-    DATA="$DEFAULT_SMOKE_DATA"
-  else
-    echo "[yolorun] Full dataset missing and smoke yaml not found." >&2
-    echo "[yolorun] Please prepare datasets/cs_ct_t_head or set DATA=<your_yaml>." >&2
-    exit 1
-  fi
+if [[ ! -f "$WEIGHTS" ]]; then
+  echo "[yolorun] weights not found: $WEIGHTS" >&2
+  for candidate in "${DEFAULT_WEIGHTS_CANDIDATES[@]}"; do
+    echo "[yolorun]   - $candidate" >&2
+  done
+  exit 1
 fi
 
 CMD=(
-  "$PYTHON_BIN" "$ROOT_DIR/visual_recognition/train.py"
-  --data "$DATA"
-  --model "$MODEL"
-  --epochs "$EPOCHS"
+  "$PYTHON_BIN" "$ROOT_DIR/visual_recognition/stream_ffplay_pipeline.py"
+  --weights "$WEIGHTS"
+  --in-stream "$IN_STREAM"
+  --out-stream "$OUT_STREAM"
+  --conf "$CONF"
   --imgsz "$IMGSZ"
-  --batch "$BATCH"
   --device "$DEVICE"
-  --project "$PROJECT"
-  --name "$NAME"
-  --workers "$WORKERS"
-  --patience "$PATIENCE"
-  --seed "$SEED"
-  --cache "$CACHE"
+  --infer-every "$INFER_EVERY"
+  --work-size "$WORK_SIZE"
+  --detect-roi "$DETECT_ROI"
+  --line-width "$LINE_WIDTH"
+  --stream-fps "$STREAM_FPS"
+  --capture-drain "$CAPTURE_DRAIN"
+  --capture-reconnect-sec "$CAPTURE_RECONNECT_SEC"
+  --capture-timeout-ms "$CAPTURE_TIMEOUT_MS"
+  --udp-fifo-size "$UDP_FIFO_SIZE"
+  --capture-probesize "$CAPTURE_PROBESIZE"
+  --capture-analyzeduration "$CAPTURE_ANALYZEDURATION"
+  --out-vcodec "$OUT_VCODEC"
+  --out-bitrate "$OUT_BITRATE"
+  --ffmpeg "$FFMPEG_BIN"
+  --ffplay "$FFPLAY_BIN"
 )
 
-if [[ "$AMP" == "1" ]]; then
-  CMD+=(--amp)
+if [[ "$HALF" == "1" ]]; then
+  CMD+=(--half)
 fi
 
-if [[ "$EXIST_OK" == "1" ]]; then
-  CMD+=(--exist-ok)
+if [[ "$PREVIEW" == "1" ]]; then
+  CMD+=(--preview)
 fi
 
-if [[ "$FORCE_PIL_IMREAD" == "1" ]]; then
-  CMD+=(--force-pil-imread)
+if [[ "$SHOW_WINDOW" == "1" ]]; then
+  CMD+=(--show)
+fi
+
+if [[ -z "$OUT_STREAM" ]]; then
+  # 避免传空字符串导致解析歧义。
+  for i in "${!CMD[@]}"; do
+    if [[ "${CMD[$i]}" == "--out-stream" ]]; then
+      unset 'CMD[i]'
+      unset 'CMD[i+1]'
+      break
+    fi
+  done
+  CMD=("${CMD[@]}")
 fi
 
 echo "[yolorun] Running: ${CMD[*]}"

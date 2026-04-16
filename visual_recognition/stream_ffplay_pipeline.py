@@ -1,8 +1,4 @@
-"""实时管道：Windows 推流 -> OpenCV 读流 -> YOLO 识别 -> ffmpeg 输出 -> ffplay 预览。
-
-这个脚本不改动现有 `predict.py` 的行为，而是单独处理视频流输入，
-避免 Ultralytics 自己去解析 udp:// 作为数据源时出现的 FileNotFoundError。
-"""
+"""YOLO 实时流管线：输入流 -> YOLO -> 输出流，并仅保留 Windows 侧观测窗口。"""
 
 from __future__ import annotations
 
@@ -10,12 +6,12 @@ import argparse
 import importlib
 import os
 import re
+import socket
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
-
+from typing import Optional
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -23,46 +19,63 @@ if str(ROOT_DIR) not in sys.path:
 
 from opengame import OpenGameTool
 
-try:
-    from visual_recognition.yolor import get_draw_yolo_and_rows
-except Exception:
-    from yolor import get_draw_yolo_and_rows
-
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Realtime YOLO stream pipeline with ffplay preview")
+    parser = argparse.ArgumentParser(description="Realtime YOLO pipeline with Windows viewer only")
     parser.add_argument("--weights", type=str, required=True, help="YOLO 权重路径")
-    parser.add_argument("--source", type=str, default="", help="输入流地址，例如 udp://192.168.x.x:12345")
-    parser.add_argument("--in-stream", type=str, default="", help="输入流地址别名，兼容旧启动脚本")
-    parser.add_argument("--out-stream", type=str, default="", help="输出流地址（为空时自动发到 Windows 主机）")
-    parser.add_argument("--preview", action="store_true", help="使用 ffplay 预览输出流")
-    parser.add_argument("--show", action="store_true", help="是否在 Python 进程内显示窗口")
-    parser.add_argument("--skip-win-stream", action="store_true", help="跳过 Windows 推流，适用于已有输入流")
-    parser.add_argument("--game-exe", type=str, default=r"E:\steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe", help="Windows 游戏可执行路径")
-    parser.add_argument("--window-title", type=str, default="auto", help="游戏窗口标题")
+
+    # 保持与现有脚本兼容。
+    parser.add_argument("--game-exe", type=str, default="", help="Windows 游戏路径")
+    parser.add_argument("--window-title", type=str, default="auto", help="窗口标题")
     parser.add_argument("--wait-game", type=float, default=6.0, help="启动游戏后等待秒数")
-    parser.add_argument("--linux-ip", type=str, default="auto", help="WSL 接收地址")
-    parser.add_argument("--port", type=int, default=12345, help="原始流端口")
-    parser.add_argument("--framerate", type=int, default=60, help="原始推流帧率")
-    parser.add_argument("--bitrate", type=str, default="2500k", help="原始推流码率")
-    parser.add_argument("--conf", type=float, default=0.30, help="检测置信度")
-    parser.add_argument("--imgsz", type=int, default=256, help="推理尺寸")
-    parser.add_argument("--device", type=str, default="0", help="设备：0 或 cpu")
-    parser.add_argument("--project", type=str, default="visual_recognition/runs", help="输出目录")
     parser.add_argument("--name", type=str, default="ct_t_yolo_ffplay", help="运行名")
-    parser.add_argument("--head-ratio", type=float, default=0.30, help="头部高度占身体框比例")
-    parser.add_argument("--head-width-ratio", type=float, default=0.45, help="头部宽度占身体框比例")
-    parser.add_argument("--line-width", type=int, default=2, help="绘图线宽")
-    parser.add_argument("--detect-roi", type=str, default="0.00,0.08,1.00,0.84", help="YOLO 识别区域")
-    parser.add_argument("--work-size", type=str, default="704x396", help="检测处理分辨率，例如 704x396")
-    parser.add_argument("--preview-size", type=str, default="800x450", help="预览窗口分辨率，例如 800x450")
-    parser.add_argument("--stream-fps", type=float, default=60.0, help="输出流帧率")
-    parser.add_argument("--frame-drain", type=int, default=4, help="每轮最多丢弃的积压帧数，越大越低延迟")
-    parser.add_argument("--infer-every", type=int, default=1, help="每 N 帧跑一次推理，其余帧复用最近结果")
-    parser.add_argument("--half", action="store_true", help="使用 FP16 半精度推理（需 GPU 支持）")
-    parser.add_argument("--udp-fifo-size", type=int, default=262144, help="UDP 接收缓存大小，越小延迟越低")
+    parser.add_argument("--skip-win-stream", action="store_true", help="跳过启动 opengame 推流")
+    parser.add_argument("--linux-ip", type=str, default="auto", help="Windows 推流目标 Linux IP")
+    parser.add_argument("--port", type=int, default=12345, help="输入流端口")
+    parser.add_argument("--framerate", type=int, default=60, help="输入流帧率")
+    parser.add_argument("--bitrate", type=str, default="2500k", help="输入流码率")
+    parser.add_argument("--frame-drain", type=int, default=0, help="兼容参数")
+    parser.add_argument("--capture-drain", type=int, default=0, help="兼容参数")
+
+    parser.add_argument("--in-stream", type=str, default="", help="输入流地址，如 udp://ip:port")
+    parser.add_argument("--source", type=str, default="", help="输入流别名")
+    parser.add_argument("--out-stream", type=str, default="", help="输出流地址，如 udp://ip:2234")
+    parser.add_argument("--preview", action="store_true", help="启用 Windows 侧观测窗口")
+
+    parser.add_argument("--conf", type=float, default=0.30, help="置信度")
+    parser.add_argument("--imgsz", type=int, default=320, help="推理尺寸")
+    parser.add_argument("--device", type=str, default="0", help="推理设备")
+    parser.add_argument("--half", action="store_true", help="半精度推理")
+    parser.add_argument("--infer-every", type=int, default=1, help="每 N 帧推理一次")
+
+    parser.add_argument("--work-size", type=str, default="704x396", help="处理分辨率")
+    parser.add_argument("--detect-roi", type=str, default="0.00,0.08,1.00,0.84", help="ROI 相对坐标")
+    parser.add_argument("--line-width", type=int, default=2, help="线宽")
+    parser.add_argument("--preview-size", type=str, default="800x450", help="兼容参数")
+
+    parser.add_argument("--stream-fps", type=float, default=60.0, help="输出帧率")
+    parser.add_argument("--capture-reconnect-sec", type=float, default=2.0, help="无帧重连秒数")
+    parser.add_argument("--capture-timeout-ms", type=int, default=4000, help="读取超时毫秒")
+    parser.add_argument("--first-frame-timeout-sec", type=float, default=20.0, help="首帧等待超时")
+    parser.add_argument("--udp-fifo-size", type=int, default=1048576, help="UDP fifo")
+    parser.add_argument("--capture-probesize", type=int, default=131072, help="输入探测字节")
+    parser.add_argument("--capture-analyzeduration", type=int, default=2000000, help="输入分析时长")
+    parser.add_argument("--sender-udp-pkt-size", type=int, default=1316, help="兼容参数")
+    parser.add_argument("--sender-udp-buffer-size", type=int, default=1048576, help="兼容参数")
+    parser.add_argument("--win-vcodec", type=str, default="mpeg1video", help="兼容参数")
+    parser.add_argument("--print-yolo", action="store_true", help="兼容参数")
+    parser.add_argument("--yolo-info-jsonl", type=str, default="", help="兼容参数")
+    parser.add_argument("--ocr", action="store_true", help="兼容参数")
+    parser.add_argument("--ocr-engine", type=str, default="pytesseract", help="兼容参数")
+    parser.add_argument("--ocr-roi", type=str, default="", help="兼容参数")
+    parser.add_argument("--ocr-min-conf", type=float, default=0.20, help="兼容参数")
+    parser.add_argument("--ocr-whitelist", type=str, default="0123456789/%:HPARMOABULLET", help="兼容参数")
+    parser.add_argument("--ocr-info-jsonl", type=str, default="", help="兼容参数")
+
+    parser.add_argument("--out-vcodec", type=str, default="mpeg2video", help="输出编码器")
+    parser.add_argument("--out-bitrate", type=str, default="2200k", help="输出码率")
     parser.add_argument("--ffmpeg", type=str, default="ffmpeg", help="ffmpeg 可执行文件")
-    parser.add_argument("--ffplay", type=str, default="ffplay", help="ffplay 可执行文件（Linux 或 Windows 均可）")
+    parser.add_argument("--ffplay", type=str, default="ffplay", help="Windows 侧 ffplay 可执行文件")
     return parser.parse_args()
 
 
@@ -77,7 +90,7 @@ def get_parse_size(size_spec: str) -> tuple[int, int]:
     return w, h
 
 
-def get_parse_single_roi(roi_spec: str) -> tuple[float, float, float, float]:
+def get_parse_roi(roi_spec: str) -> tuple[float, float, float, float]:
     parts = [p.strip() for p in str(roi_spec or "").split(",")]
     if len(parts) != 4:
         raise ValueError(f"invalid roi spec: {roi_spec}")
@@ -104,33 +117,44 @@ def get_roi_abs(w_img: int, h_img: int, roi_rel: tuple[float, float, float, floa
     return x1, y1, x2, y2
 
 
-def get_parse_input_source(source: str):
-    source = str(source or "").strip()
-    if source.isdigit():
-        return int(source)
-    return source
-
-
-def parse_udp_endpoint(url: str) -> tuple[str, int]:
-    """从 udp://ip:port URL 解析出 ip 与端口。"""
-    m = re.match(r"^udp://([^:/?#]+):(\d+)", (url or "").strip())
+def get_parse_udp_endpoint(url: str) -> tuple[str, int]:
+    m = re.match(r"^udp://([^:/?#]+):(\d+)", str(url or "").strip())
     if not m:
         raise ValueError(f"invalid udp endpoint: {url}")
     return m.group(1), int(m.group(2))
 
 
 def get_udp_listen_url(url: str, fifo_size: int) -> str:
-    """把 udp://host:port 转换为本地监听用的 udp://@:port。"""
-    _, port = parse_udp_endpoint(url)
+    _, port = get_parse_udp_endpoint(url)
     return f"udp://@:{port}?fifo_size={int(max(4096, fifo_size))}&overrun_nonfatal=1"
 
 
-def get_windows_host_ip() -> str:
-    """获取 WSL 中可访问到的 Windows 主机 IP。"""
-    resolv_conf = Path("/etc/resolv.conf")
+def get_udp_sender_url(url: str, pkt_size: int, buffer_size: int) -> str:
+    src = str(url or "").strip()
+    if not src.startswith("udp://"):
+        return src
+    sep = "&" if "?" in src else "?"
+    pkt_size = int(max(188, pkt_size))
+    buffer_size = int(max(65536, buffer_size))
+    return f"{src}{sep}pkt_size={pkt_size}&buffer_size={buffer_size}"
+
+
+def get_resolve_linux_ip(default_ip: str = "127.0.0.1") -> str:
     try:
-        if resolv_conf.exists():
-            for line in resolv_conf.read_text(encoding="utf-8", errors="ignore").splitlines():
+        proc = subprocess.run(["hostname", "-I"], check=True, capture_output=True, text=True)
+        parts = [item.strip() for item in (proc.stdout or "").split() if item.strip()]
+        if parts:
+            return parts[0]
+    except Exception:
+        pass
+    return default_ip
+
+
+def get_windows_host_ip(default_ip: str = "127.0.0.1") -> str:
+    try:
+        resolv = Path("/etc/resolv.conf")
+        if resolv.exists():
+            for line in resolv.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if line.startswith("nameserver "):
                     parts = line.split()
@@ -140,87 +164,74 @@ def get_windows_host_ip() -> str:
         pass
 
     try:
-        proc = subprocess.run(["sh", "-lc", "ip route | awk '/default/ {print $3; exit}'"], check=True, capture_output=True, text=True)
-        ip = (proc.stdout or "").strip()
-        if ip:
-            return ip
+        proc = subprocess.run(["ip", "route", "show", "default"], check=True, capture_output=True, text=True)
+        for line in (proc.stdout or "").splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
+                return parts[2].strip()
     except Exception:
         pass
 
-    return "127.0.0.1"
+    return default_ip
 
 
-def get_build_udp_url(host: str, port: int) -> str:
-    return f"udp://{host}:{int(port)}"
+def get_pick_free_udp_port(preferred_port: int, max_tries: int = 32) -> int:
+    preferred_port = int(preferred_port)
+    for port in range(preferred_port, preferred_port + max(1, int(max_tries))):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("0.0.0.0", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
-def get_udp_listen_url_from_port(port: int, fifo_size: int) -> str:
-    return f"udp://@:{int(port)}?fifo_size={int(max(4096, fifo_size))}&overrun_nonfatal=1"
+def get_open_capture(cv2, source, timeout_ms: int):
+    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return None
+
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    timeout_ms = int(max(500, timeout_ms))
+    for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+        prop_id = getattr(cv2, prop_name, None)
+        if prop_id is None:
+            continue
+        try:
+            cap.set(prop_id, timeout_ms)
+        except Exception:
+            pass
+    return cap
 
 
-def get_start_windows_ffplay(ffplay_path: str, input_url: str) -> bool:
-    """在 Windows 桌面启动 ffplay 预览。"""
-    ffplay_exe = str(ffplay_path or "").replace("\\\\", "\\").strip()
-    win_args = [
-        "-x",
-        "800",
-        "-y",
-        "450",
-        "-fflags",
-        "nobuffer",
-        "-flags",
-        "low_delay",
-        "-framedrop",
-        "-probesize",
-        "32",
-        "-analyzeduration",
-        "0",
-        input_url,
-    ]
-    if not ffplay_exe:
-        ffplay_exe = "ffplay.exe"
-
-    ffplay_exe_ps = ffplay_exe.replace("'", "''")
-    args_ps = ",".join("'" + a.replace("'", "''") + "'" for a in win_args)
-    ps = (
-        f"$pref='{ffplay_exe_ps}'; "
-        "$exe=''; "
-        "if ($pref -and (Test-Path $pref)) { $exe=$pref } "
-        "if (-not $exe) { "
-        "  $cmd=Get-Command ffplay.exe -ErrorAction SilentlyContinue; "
-        "  if ($cmd -and $cmd.Source) { $exe=$cmd.Source } "
-        "} "
-        "if (-not $exe) { Write-Output '__ERR__NOEXE__'; exit 2 }; "
-        f"$args=@({args_ps}); "
-        "Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Normal; "
-        "Start-Sleep -Milliseconds 500; "
-        "if (Get-Process -Name ffplay -ErrorAction SilentlyContinue) { Write-Output ('__OK__|' + $exe) } else { Write-Output ('__ERR__NOPROC__|' + $exe) }"
-    )
-
-    proc = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-Command", ps],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    if out.startswith("__OK__|"):
-        exe_used = out.split("|", 1)[1]
-        print(f"[yolo_ffplay] winffplay started: {exe_used}")
-        return True
-    if out.startswith("__ERR__NOEXE__"):
-        print(f"[yolo_ffplay] winffplay failed: ffplay not found (preferred={ffplay_path})", file=sys.stderr)
-        return False
-    if out.startswith("__ERR__NOPROC__|"):
-        exe_used = out.split("|", 1)[1]
-        print(f"[yolo_ffplay] winffplay failed to stay running: {exe_used}", file=sys.stderr)
-    if err:
-        print(f"[yolo_ffplay] winffplay stderr: {err}", file=sys.stderr)
-    return False
-
-
-def get_start_ffmpeg_stream_writer(output_url: str, width: int, height: int, fps: float, ffmpeg_path: str) -> subprocess.Popen:
+def get_start_ffmpeg_stream_writer(
+    output_url: str,
+    width: int,
+    height: int,
+    fps: float,
+    ffmpeg_path: str,
+    out_vcodec: str,
+    out_bitrate: str,
+) -> subprocess.Popen:
     cmd = [
         ffmpeg_path,
         "-hide_banner",
@@ -238,371 +249,357 @@ def get_start_ffmpeg_stream_writer(output_url: str, width: int, height: int, fps
         "-",
         "-an",
         "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
+        out_vcodec,
+        "-pix_fmt",
+        "yuv420p",
         "-g",
-        "30",
-        "-keyint_min",
-        "30",
-        "-x264-params",
-        "repeat-headers=1:scenecut=0",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
+        "12",
+        "-b:v",
+        out_bitrate,
         "-f",
         "mpegts",
         output_url,
     ]
+
+    if out_vcodec == "libx264":
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-bf",
+            "0",
+            "-g",
+            "12",
+            "-keyint_min",
+            "12",
+            "-x264-params",
+            "repeat-headers=1:aud=1:scenecut=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            out_bitrate,
+            "-mpegts_flags",
+            "+resend_headers",
+            "-flush_packets",
+            "1",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-f",
+            "mpegts",
+            output_url,
+        ]
+
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
 
 
-def get_start_ffplay_raw_preview(ffplay_path: str, width: int, height: int, fps: float) -> subprocess.Popen:
-    """启动本机 ffplay，直接从 stdin 读取原始 BGR 帧进行预览。"""
-    cmd = [
-        ffplay_path,
-        "-x",
-        "800",
-        "-y",
-        "450",
-        "-fflags",
-        "nobuffer",
-        "-flags",
-        "low_delay",
-        "-framedrop",
-        "-f",
-        "rawvideo",
-        "-pixel_format",
-        "bgr24",
-        "-video_size",
-        f"{width}x{height}",
-        "-framerate",
-        f"{fps}",
-        "-i",
-        "-",
-    ]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+def get_draw_boxes(cv2, frame, boxes, line_width: int) -> None:
+    for item in boxes:
+        x1, y1, x2, y2, conf, name = item
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 255), max(1, line_width))
+        label = f"{name} {conf:.2f}"
+        cv2.putText(frame, label, (x1, max(16, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1, cv2.LINE_AA)
 
 
-def get_start_ffplay_preview(ffplay_path: str, input_url: str) -> subprocess.Popen:
-    cmd = [
-        ffplay_path,
-        "-x",
-        "800",
-        "-y",
-        "450",
-        "-fflags",
-        "nobuffer",
-        "-flags",
-        "low_delay",
-        "-framedrop",
-        "-probesize",
-        "32",
-        "-analyzeduration",
-        "0",
-        input_url,
-    ]
-    return subprocess.Popen(cmd)
+def get_extract_boxes(result, ox: int, oy: int, names_map: dict[int, str]) -> list[tuple[int, int, int, int, float, str]]:
+    out: list[tuple[int, int, int, int, float, str]] = []
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return out
 
+    try:
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        conf = boxes.conf.detach().cpu().numpy()
+        cls = boxes.cls.detach().cpu().numpy().astype(int)
+    except Exception:
+        return out
 
-def get_make_status_frame(cv2, width: int, height: int, message: str):
-    import numpy as np
-
-    frame = np.zeros((height, width, 3), dtype=np.uint8)
-    cv2.putText(frame, message, (24, max(36, height // 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-    return frame
+    for idx in range(len(xyxy)):
+        x1, y1, x2, y2 = xyxy[idx]
+        c = float(conf[idx])
+        k = int(cls[idx])
+        name = str(names_map.get(k, str(k)))
+        out.append((int(x1) + ox, int(y1) + oy, int(x2) + ox, int(y2) + oy, c, name))
+    return out
 
 
 def main() -> int:
     args = get_args()
+    boot_t0 = time.monotonic()
+
+    def _log(msg: str) -> None:
+        print(f"[yolorun] {msg}", flush=True)
+
+    source_text = (args.in_stream or args.source or "").strip()
+    linux_ip = args.linux_ip
+    if str(linux_ip).lower() == "auto":
+        linux_ip = get_resolve_linux_ip("127.0.0.1")
+
+    preferred_port = int(args.port)
+    if not source_text:
+        source_text = f"udp://{linux_ip}:{preferred_port}"
+
+    actual_port = preferred_port
+    default_source_text = f"udp://{linux_ip}:{preferred_port}"
+    if source_text == default_source_text:
+        actual_port = get_pick_free_udp_port(preferred_port)
+        if actual_port != preferred_port:
+            print(f"[yolorun] stage=port_adjusted preferred={preferred_port} actual={actual_port}", flush=True)
+            source_text = f"udp://{linux_ip}:{actual_port}"
 
     try:
         ultralytics = importlib.import_module("ultralytics")
         YOLO = ultralytics.YOLO
-    except ImportError as exc:
-        raise ImportError("未安装 ultralytics。请先执行: pip install ultralytics") from exc
+    except Exception as exc:
+        raise ImportError("未安装 ultralytics，请先安装。") from exc
 
     try:
         torch = importlib.import_module("torch")
-    except ImportError as exc:
-        raise ImportError("未安装 torch。请先安装带 CUDA 的 torch 版本") from exc
+    except Exception as exc:
+        raise ImportError("未安装 torch，请先安装。") from exc
 
-    if str(args.device).lower() != "cpu":
-        if not bool(torch.cuda.is_available()):
-            raise SystemExit("当前未检测到可用 CUDA。请安装 CUDA 版 torch，或检查 GPU 驱动。")
-        try:
-            torch.backends.cudnn.benchmark = True
-        except Exception:
-            pass
+    if str(args.device).lower() != "cpu" and not bool(torch.cuda.is_available()):
+        raise SystemExit("未检测到 CUDA，请改用 --device cpu 或安装 CUDA 版 torch。")
 
     try:
         cv2 = importlib.import_module("cv2")
-    except ImportError as exc:
-        raise ImportError("未安装 opencv-python。请先执行: pip install opencv-python") from exc
+    except Exception as exc:
+        raise ImportError("未安装 opencv-python，请先安装。") from exc
 
+    _log(f"stage=model_loading weights={args.weights}")
     model = YOLO(args.weights)
+    _log(f"stage=model_loaded elapsed={time.monotonic() - boot_t0:.2f}s")
+    names_map = getattr(model, "names", {})
+
     work_w, work_h = get_parse_size(args.work_size)
-    preview_w, preview_h = get_parse_size(args.preview_size)
-    detect_roi_rel = get_parse_single_roi(args.detect_roi)
-    source_text = args.source or args.in_stream
-    if not source_text:
-        raise SystemExit("需要提供 --source 或 --in-stream")
-    source_url = get_udp_listen_url(source_text, int(args.udp_fifo_size)) if source_text.startswith("udp://") else source_text
-    source = get_parse_input_source(source_url)
+    roi_rel = get_parse_roi(args.detect_roi)
 
-    stream_tool = None
-    preview_started = False
-    preview_proc = None
-    ffmpeg_stream_proc = None
-    cap = None
-    cap_thread = None
-    cap_lock = None
-    cap_state = None
+    input_listen_url = get_udp_listen_url(source_text, fifo_size=int(args.udp_fifo_size))
+    input_send_url = get_udp_sender_url(
+        source_text,
+        pkt_size=int(args.sender_udp_pkt_size),
+        buffer_size=int(args.sender_udp_buffer_size),
+    )
 
-    windows_host_ip = get_windows_host_ip()
-    send_url = args.out_stream.strip() or ""
-    preview_url = get_udp_listen_url_from_port(2234, int(args.udp_fifo_size)) if send_url else ""
+    output_url = str(args.out_stream or "").strip()
+    if not output_url:
+        output_url = f"udp://{get_windows_host_ip()}:2234"
+        _log(f"stage=out_stream_defaulted url={output_url}")
+    else:
+        _log(f"stage=out_stream_configured url={output_url}")
 
-    try:
-        if not args.skip_win_stream:
-            in_ip = args.linux_ip
-            if in_ip == "auto":
-                try:
-                    proc = subprocess.run(["hostname", "-I"], check=True, capture_output=True, text=True)
-                    parts = [item.strip() for item in proc.stdout.split() if item.strip()]
-                    if parts:
-                        in_ip = parts[0]
-                except Exception:
-                    in_ip = "127.0.0.1"
-
-            stream_tool = OpenGameTool(
-                game_exe=args.game_exe,
-                game_args=["-applaunch", "730"],
-                linux_ip=in_ip,
-                port=int(args.port),
-                framerate=int(args.framerate),
-                bitrate=str(args.bitrate),
-                window_title=args.window_title,
-                stream_outputs=[source_text],
-            )
-            stream_tool.open_game(wait_seconds=float(args.wait_game))
-            proc = stream_tool.start_stream(with_viewer=False)
-            if proc is None:
-                print("[yolo_ffplay] Windows 推流启动失败。", file=sys.stderr)
-                return 1
-            print(f"[yolo_ffplay] Windows 推流已启动 -> {source_text}")
-            time.sleep(0.8)
-
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
-        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            print(f"[yolo_ffplay] 无法打开输入流: {source_url}", file=sys.stderr)
-            return 1
-
+    viewer_source = None
+    if args.preview and output_url.startswith("udp://"):
         try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            _, out_port = get_parse_udp_endpoint(output_url)
+            local_viewer_url = f"udp://127.0.0.1:{out_port}?fifo_size=1000000&overrun_nonfatal=1"
+            viewer_source = local_viewer_url
+            _log(f"stage=win_preview_source {local_viewer_url}")
         except Exception:
-            pass
+            viewer_source = None
 
-        cap_lock = threading.Lock()
-        cap_state = {"running": True, "seq": 0, "frame": None}
-        def _capture_worker() -> None:
-            while bool(cap_state["running"]):
-                ok_read, frame_read = cap.read()
-                if not ok_read or frame_read is None:
-                    time.sleep(0.001)
-                    continue
-                with cap_lock:
-                    cap_state["frame"] = frame_read
-                    cap_state["seq"] = int(cap_state["seq"]) + 1
+    capture_opts = (
+        "fflags;nobuffer"
+        f"|probesize;{int(max(1024, int(args.capture_probesize)))}"
+        f"|analyzeduration;{int(max(0, int(args.capture_analyzeduration)))}"
+        "|max_delay;0"
+    )
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = capture_opts
 
-        cap_thread = threading.Thread(target=_capture_worker, daemon=True)
-        cap_thread.start()
+    _log(f"stage=input_listen url={input_listen_url}")
+    _log(f"stage=input_send url={input_send_url}")
+    _log(f"stage=capture_opts {capture_opts}")
 
-        if args.show:
+    stream_tool: Optional[OpenGameTool] = None
+    viewer_tool: Optional[OpenGameTool] = None
+
+    if not args.skip_win_stream:
+        _log(
+            "stage=opengame_start "
+            f"linux_ip={linux_ip} port={actual_port} bitrate={args.bitrate} framerate={args.framerate}"
+        )
+        stream_tool = OpenGameTool(
+            game_exe=str(args.game_exe),
+            game_args=["-applaunch", "730"],
+            linux_ip=str(linux_ip),
+            port=int(actual_port),
+            framerate=int(args.framerate),
+            bitrate=str(args.bitrate),
+            window_title=str(args.window_title),
+            stream_outputs=[input_send_url],
+            ffplay_path=str(args.ffplay),
+        )
+        stream_tool.open_game(wait_seconds=float(args.wait_game))
+        p = stream_tool.start_stream(with_viewer=False)
+        if p is None:
+            print("[yolorun] opengame start stream failed", file=sys.stderr, flush=True)
+            return 1
+        _log("stage=opengame_started")
+        time.sleep(0.6)
+
+    _log("stage=capture_opening")
+    cap = get_open_capture(cv2, input_listen_url, timeout_ms=int(args.capture_timeout_ms))
+    if cap is None:
+        print(f"[yolorun] open stream failed: {input_listen_url}", file=sys.stderr, flush=True)
+        if stream_tool is not None:
             try:
-                cv2.namedWindow("yolo_ffplay", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("yolo_ffplay", preview_w, preview_h)
-                cv2.imshow("yolo_ffplay", get_make_status_frame(cv2, preview_w, preview_h, "waiting for frames..."))
-                cv2.waitKey(1)
+                stream_tool.stop_stream()
             except Exception:
                 pass
+        return 1
+    _log(f"stage=capture_opened elapsed={time.monotonic() - boot_t0:.2f}s")
 
-        frame_id = 0
-        last_seq = 0
-        last_result = None
-        last_yolo_rows: list[list[str]] = []
+    out_proc = None
+    first_frame_t0 = time.monotonic()
+    first_frame_logged = False
+    first_infer_logged = False
+    last_boxes: list[tuple[int, int, int, int, float, str]] = []
+    frame_id = 0
+    fps_t0 = time.monotonic()
+    fps_count = 0
+    wait_log_t0 = time.monotonic()
+
+    try:
         while True:
-            with cap_lock:
-                cur_seq = int(cap_state["seq"])
-                frame = cap_state["frame"]
-
-            if frame is None or cur_seq <= last_seq:
-                if args.show:
-                    try:
-                        cv2.imshow("yolo_ffplay", get_make_status_frame(cv2, preview_w, preview_h, "waiting for frames..."))
-                        cv2.waitKey(1)
-                    except Exception:
-                        pass
-                time.sleep(0.001)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                now = time.monotonic()
+                if (now - wait_log_t0) >= 5.0:
+                    wait_log_t0 = now
+                    _log("stage=waiting_frame no new frame yet")
+                if (not first_frame_logged) and ((now - first_frame_t0) >= float(max(1.0, args.first_frame_timeout_sec))):
+                    print(
+                        "[yolorun] first frame timeout: input stream has no decodable frame yet.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 2
+                if stream_tool is not None and float(args.capture_reconnect_sec) > 0:
+                    if (now - first_frame_t0) >= float(args.capture_reconnect_sec):
+                        _log("stage=opengame_restart_stream")
+                        stream_tool.restart_stream(with_viewer=False, cooldown_sec=0.8)
+                        first_frame_t0 = now
+                time.sleep(0.002)
                 continue
-            last_seq = cur_seq
-            frame = frame.copy()
 
-            if frame is None:
-                continue
+            if not first_frame_logged:
+                first_frame_logged = True
+                _log(f"stage=first_frame elapsed={time.monotonic() - boot_t0:.2f}s")
+
             if frame.shape[1] != work_w or frame.shape[0] != work_h:
                 frame = cv2.resize(frame, (work_w, work_h), interpolation=cv2.INTER_AREA)
 
-            frame_id += 1
             h_img, w_img = frame.shape[:2]
-            detect_roi_abs = get_roi_abs(w_img, h_img, detect_roi_rel)
-            drx1, dry1, drx2, dry2 = detect_roi_abs
-            cv2.rectangle(frame, (drx1, dry1), (drx2, dry2), (180, 180, 0), 1)
+            x1, y1, x2, y2 = get_roi_abs(w_img, h_img, roi_rel)
+            roi_frame = frame[y1:y2, x1:x2]
 
+            frame_id += 1
             infer_every = max(1, int(args.infer_every))
-            run_infer = (frame_id % infer_every == 0) or (last_result is None)
+            run_infer = (frame_id % infer_every == 0) or (not last_boxes)
+
             if run_infer:
-                last_result = model.predict(
-                    frame,
+                result = model.predict(
+                    roi_frame,
                     conf=float(args.conf),
                     imgsz=int(args.imgsz),
                     device=args.device,
                     half=bool(args.half),
                     verbose=False,
                 )[0]
+                last_boxes = get_extract_boxes(result, ox=x1, oy=y1, names_map=names_map)
+                if not first_infer_logged:
+                    first_infer_logged = True
+                    _log(f"stage=first_infer elapsed={time.monotonic() - boot_t0:.2f}s boxes={len(last_boxes)}")
 
-            if last_result is not None:
-                yolo_rows = get_draw_yolo_and_rows(
-                    result=last_result,
-                    img=frame,
-                    w_img=w_img,
-                    h_img=h_img,
-                    model_names=model.names,
-                    head_ratio=float(args.head_ratio),
-                    head_width_ratio=float(args.head_width_ratio),
-                    line_width=int(args.line_width),
-                    cv2=cv2,
-                    detect_roi_abs=detect_roi_abs,
-                )
-                last_yolo_rows = yolo_rows
-            else:
-                yolo_rows = last_yolo_rows
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
+            get_draw_boxes(cv2, frame, last_boxes, line_width=int(args.line_width))
 
-            if send_url and ffmpeg_stream_proc is None:
-                ffmpeg_stream_proc = get_start_ffmpeg_stream_writer(
-                    output_url=send_url,
+            if out_proc is None:
+                out_proc = get_start_ffmpeg_stream_writer(
+                    output_url=output_url,
                     width=w_img,
                     height=h_img,
                     fps=float(args.stream_fps),
                     ffmpeg_path=args.ffmpeg,
+                    out_vcodec=args.out_vcodec,
+                    out_bitrate=args.out_bitrate,
                 )
+                _log(f"stage=out_stream_started url={output_url}")
 
-            if ffmpeg_stream_proc is not None and ffmpeg_stream_proc.stdin is not None:
+                if args.preview and stream_tool is not None:
+                    try:
+                        viewer_tool = OpenGameTool(
+                            game_exe=str(args.game_exe),
+                            ffplay_path=str(args.ffplay),
+                            viewer_source=viewer_source,
+                        )
+                        if viewer_tool.start_windows_viewer():
+                            _log(f"stage=win_preview_started url={viewer_source}")
+                        else:
+                            _log("stage=win_preview_failed")
+                    except Exception:
+                        _log("stage=win_preview_failed")
+
+            if out_proc is not None and out_proc.stdin is not None:
                 try:
-                    ffmpeg_stream_proc.stdin.write(frame.tobytes())
+                    out_proc.stdin.write(frame.tobytes())
                 except (BrokenPipeError, OSError):
-                    ffmpeg_stream_proc = None
+                    _log("stage=out_stream_broken_restart")
+                    out_proc = None
 
-            if args.preview and preview_proc is None:
-                try:
-                    preview_proc = get_start_ffplay_raw_preview(
-                        ffplay_path=args.ffplay,
-                        width=w_img,
-                        height=h_img,
-                        fps=float(args.stream_fps),
-                    )
-                    preview_started = True
-                    print("[yolo_ffplay] ffplay 原始帧预览已启动")
-                except Exception as exc:
-                    print(f"[yolo_ffplay] 本机 ffplay 启动失败: {exc}", file=sys.stderr)
-                    if get_start_windows_ffplay(args.ffplay, preview_url):
-                        preview_started = True
-                        print(f"[yolo_ffplay] Windows ffplay 预览已启动 -> {preview_url}")
-                    else:
-                        print("[yolo_ffplay] ffplay 启动失败，继续仅输出流", file=sys.stderr)
-
-            if preview_proc is not None and preview_proc.stdin is not None:
-                try:
-                    preview_proc.stdin.write(frame.tobytes())
-                except (BrokenPipeError, OSError):
-                    preview_proc = None
-
-            if args.show:
-                try:
-                    cv2.namedWindow("yolo_ffplay", cv2.WINDOW_NORMAL)
-                except Exception:
-                    pass
-                cv2.imshow("yolo_ffplay", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    break
-
-            if frame_id % 60 == 0:
-                print(f"[yolo_ffplay] processed frame {frame_id}, detections={len(yolo_rows)}")
+            fps_count += 1
+            now = time.monotonic()
+            if (now - fps_t0) >= 1.0:
+                fps = fps_count / max(1e-6, (now - fps_t0))
+                _log(f"fps={fps:.1f} boxes={len(last_boxes)} infer_every={infer_every}")
+                fps_t0 = now
+                fps_count = 0
 
         return 0
     except KeyboardInterrupt:
         return 130
     finally:
-        if cap_state is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+        if out_proc is not None:
             try:
-                cap_state["running"] = False
-            except Exception:
-                pass
-        if cap_thread is not None:
-            try:
-                cap_thread.join(timeout=1.0)
-            except Exception:
-                pass
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
-        if args.show:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
-        if ffmpeg_stream_proc is not None:
-            try:
-                if ffmpeg_stream_proc.stdin is not None:
-                    ffmpeg_stream_proc.stdin.close()
+                if out_proc.stdin is not None:
+                    out_proc.stdin.close()
             except Exception:
                 pass
             try:
-                ffmpeg_stream_proc.terminate()
+                out_proc.terminate()
             except Exception:
                 pass
-        if preview_proc is not None:
+
+        if viewer_tool is not None:
             try:
-                if preview_proc.stdin is not None:
-                    preview_proc.stdin.close()
+                viewer_tool.stop_windows_viewer()
             except Exception:
                 pass
-            try:
-                preview_proc.terminate()
-            except Exception:
-                pass
-        if preview_started:
-            try:
-                subprocess.run(
-                    [
-                        "powershell.exe",
-                        "-NoProfile",
-                        "-Command",
-                        "Get-Process -Name ffplay -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }",
-                    ],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
+
         if stream_tool is not None:
             try:
                 stream_tool.stop_stream()
