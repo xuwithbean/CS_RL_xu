@@ -48,7 +48,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--preview", action="store_true", help="启用 Windows 侧观测窗口")
 
     parser.add_argument("--conf", type=float, default=0.30, help="置信度")
-    parser.add_argument("--imgsz", type=int, default=80, help="推理尺寸")
+    parser.add_argument("--imgsz", type=int, default=96, help="推理尺寸")
     parser.add_argument("--device", type=str, default="0", help="推理设备")
     parser.add_argument("--half", action="store_true", help="半精度推理")
     parser.add_argument("--infer-every", type=int, default=4, help="每 N 帧推理一次")
