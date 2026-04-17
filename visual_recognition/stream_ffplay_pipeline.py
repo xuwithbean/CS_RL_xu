@@ -860,6 +860,33 @@ class get_qwen_location_client:
         image_data_url = get_build_image_data_url_from_frame(cv2, frame, roi_rel)
         return self.get_query_location(image_data_url)
 
+    def get_query_next_action(self, summary_text: str, image_data_url: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "你是CS战术助手，只输出下一步建议的一句话，不要输出代码，不要输出控制指令。\n"
+                                f"当前状态：{summary_text}\n"
+                                "请结合该原生截图内容给出下一步建议。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url},
+                        },
+                    ],
+                },
+            ],
+            extra_body={"enable_thinking": False},
+            stream=False,
+        )
+        return str((response.choices[0].message.content or "").strip())
+
 
 class get_latest_location_worker:
     """异步位置识别：处理最新 ROI 快照并在后台请求 Qwen。"""
@@ -1241,6 +1268,96 @@ def get_format_ocr_results_log(ocr_results: list[dict]) -> str:
     return "ocr_results=[" + ",".join(parts) + "]"
 
 
+def get_resolve_qwen_api_key(explicit_key: str = "") -> str:
+    key = str(explicit_key or "").strip()
+    if key:
+        return key
+    return str(
+        os.environ.get("DASHSCOPE_API_KEY")
+        or os.environ.get("QWEN_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+
+
+class get_frame_ocr_interface:
+    """供外部模块按帧触发 OCR 检测的接口。"""
+
+    def __init__(self, args, cv2_module):
+        self.cv2 = cv2_module
+        self.ocr_rois = get_parse_ocr_rois(getattr(args, "ocr_roi", ""))
+        self.ocr_reader = get_ocr_reader(args)
+        self.min_conf = float(getattr(args, "ocr_min_conf", 0.20))
+
+    def get_detect(self, frame) -> list[dict]:
+        if frame is None or self.ocr_reader is None:
+            return []
+        return get_run_ocr_on_rois(
+            cv2=self.cv2,
+            frame=frame,
+            ocr_rois=self.ocr_rois,
+            ocr_reader=self.ocr_reader,
+            min_conf=self.min_conf,
+        )
+
+    @staticmethod
+    def get_compact_text(ocr_results: list[dict]) -> str:
+        texts: list[str] = []
+        for item in ocr_results:
+            text = str((item or {}).get("text", "") or "").strip()
+            if text:
+                texts.append(text)
+        return " | ".join(texts)
+
+
+def get_write_shared_runtime_artifacts(
+    cv2,
+    frame,
+    centers: list[tuple[str, int, int, float]],
+    frame_path: str,
+    state_path: str,
+) -> None:
+    """写入跨进程共享数据：最新原生帧和最新中心点结果。"""
+    if frame is not None and str(frame_path or "").strip():
+        frame_target = Path(str(frame_path))
+        try:
+            frame_target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # 避免 `cv2.imwrite("*.tmp")` 因无图像扩展名写失败，改为统一编码 JPEG 字节再原子替换。
+        ok, encoded = cv2.imencode(".jpg", frame)
+        if ok:
+            tmp_frame = str(frame_target) + ".tmp"
+            with open(tmp_frame, "wb") as f:
+                f.write(bytes(encoded))
+            os.replace(tmp_frame, str(frame_target))
+
+    if str(state_path or "").strip():
+        state_target = Path(str(state_path))
+        try:
+            state_target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        payload = {
+            "ts": time.time(),
+            "centers": [
+                {
+                    "name": str(name),
+                    "cx": int(cx),
+                    "cy": int(cy),
+                    "conf": float(conf),
+                }
+                for name, cx, cy, conf in (centers or [])
+            ],
+        }
+        tmp_state = str(state_target) + ".tmp"
+        with open(tmp_state, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_state, str(state_target))
+
+
 def main() -> int:
     global LATEST_CENTER_POINTS, LATEST_OCR_RESULTS, LATEST_LOCATION_RESULT
     args = get_args()
@@ -1341,16 +1458,7 @@ def main() -> int:
     ocr_rois = get_parse_ocr_rois(args.ocr_roi)
     ocr_reader = get_ocr_reader(args)
     if bool(args.ocr):
-        _log(f"stage=ocr_enabled regions={len(ocr_rois)} engine={args.ocr_engine}")
-        if ocr_reader is None:
-            _log("stage=ocr_disabled_runtime reason=ocr_engine_or_dependency_unavailable")
-        else:
-            ocr_worker = get_latest_ocr_worker(
-                cv2_module=cv2,
-                ocr_rois=ocr_rois,
-                ocr_reader=ocr_reader,
-                min_conf=float(args.ocr_min_conf),
-            )
+        _log("stage=ocr_schedule_disabled reason=moved_to_decision_advisor")
 
     location_roi_rel = get_parse_roi(args.location_roi)
     location_seen_version = 0
@@ -1358,32 +1466,8 @@ def main() -> int:
     last_location_text = ""
     print(f"location_status=default_enabled={bool(args.location_detect)}", flush=True)
     if bool(args.location_detect):
-        resolved_location_model = get_resolve_location_model(args.location_model)
-        api_key = str(
-            os.environ.get("DASHSCOPE_API_KEY")
-            or os.environ.get("QWEN_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or ""
-        ).strip()
-        if not api_key:
-            _log("stage=location_disabled reason=missing_QWEN_API_KEY")
-            print("location_status=disabled reason=missing_QWEN_API_KEY", flush=True)
-        else:
-            location_client = get_qwen_location_client(
-                api_key=api_key,
-                model=resolved_location_model,
-            )
-            location_worker = get_latest_location_worker(
-                cv2_module=cv2,
-                location_client=location_client,
-                roi_rel=location_roi_rel,
-                log_func=_log,
-            )
-            _log(f"stage=location_enabled model={resolved_location_model} roi={args.location_roi}")
-            print(
-                f"location_status=enabled model={resolved_location_model} every={args.location_every}s roi={args.location_roi}",
-                flush=True,
-            )
+        _log("stage=location_schedule_disabled reason=moved_to_decision_advisor")
+        print("location_status=disabled reason=moved_to_decision_advisor", flush=True)
 
     input_listen_url = get_udp_listen_url(source_text, fifo_size=int(args.udp_fifo_size))
     input_send_url = get_udp_sender_url(
@@ -1481,6 +1565,11 @@ def main() -> int:
     draw_ocr_roi = bool(args.draw_ocr_roi)
     last_ocr_results: list[dict] = []
     ocr_seen_version = 0
+    shared_frame_path = str(os.environ.get("CSRL_SHARED_FRAME_PATH") or "/tmp/cs_rl_latest_frame.jpg").strip()
+    shared_state_path = str(os.environ.get("CSRL_SHARED_STATE_PATH") or "/tmp/cs_rl_runtime_state.json").strip()
+    shared_write_interval_sec = 0.15
+    last_shared_write_t = 0.0
+    _log(f"stage=shared_artifacts frame={shared_frame_path} state={shared_state_path}")
     max_frame_drain = max(0, int(args.capture_drain or args.frame_drain or 0))
     if max_frame_drain > 0:
         _log(f"stage=frame_drain_enabled max_drain={max_frame_drain}")
@@ -1587,6 +1676,19 @@ def main() -> int:
                     last_centers = []
                 LATEST_CENTER_POINTS = last_centers
 
+            if (now - last_shared_write_t) >= shared_write_interval_sec:
+                last_shared_write_t = now
+                try:
+                    get_write_shared_runtime_artifacts(
+                        cv2=cv2,
+                        frame=native_ocr_frame,
+                        centers=last_centers,
+                        frame_path=shared_frame_path,
+                        state_path=shared_state_path,
+                    )
+                except Exception:
+                    pass
+
             roi_x1, roi_y1, roi_x2, roi_y2 = get_roi_abs(out_w, out_h, roi_rel)
             cv2.rectangle(output_frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (120, 120, 120), 1)
             get_draw_boxes(cv2, output_frame, last_boxes, line_width=int(args.line_width))
@@ -1594,48 +1696,7 @@ def main() -> int:
             if draw_ocr_roi:
                 get_draw_ocr_rois(cv2, output_frame, ocr_rois, ocr_results=last_ocr_results)
 
-            if bool(args.ocr):
-                ocr_every = max(1, int(args.ocr_every))
-                if frame_id % ocr_every == 0:
-                    if ocr_worker is not None:
-                        # 抽帧策略：每 N 帧复制一帧快照，交给后台 OCR 线程处理。
-                        ocr_worker.submit(frame_id=frame_id, frame_snapshot=native_ocr_frame)
-                    elif ocr_reader is not None:
-                        ocr_results = get_run_ocr_on_rois(
-                            cv2=cv2,
-                            frame=native_ocr_frame,
-                            ocr_rois=ocr_rois,
-                            ocr_reader=ocr_reader,
-                            min_conf=float(args.ocr_min_conf),
-                        )
-                        last_ocr_results = ocr_results
-                        LATEST_OCR_RESULTS = ocr_results
-                        _log(get_format_ocr_results_log(LATEST_OCR_RESULTS))
-                    else:
-                        ocr_results = []
-                        last_ocr_results = ocr_results
-                        LATEST_OCR_RESULTS = ocr_results
-                        _log(get_format_ocr_results_log(LATEST_OCR_RESULTS))
-
-                if ocr_worker is not None:
-                    ocr_seen_version, latest_ocr = ocr_worker.get_latest_since(ocr_seen_version)
-                    if latest_ocr is not None:
-                        last_ocr_results = latest_ocr
-                        LATEST_OCR_RESULTS = latest_ocr
-                        _log(get_format_ocr_results_log(LATEST_OCR_RESULTS))
-
-            if location_worker is not None:
-                loc_every_sec = max(0.5, float(args.location_every))
-                if (now - last_location_submit_t) >= loc_every_sec:
-                    print(f"location_query=ask every={loc_every_sec}s roi={args.location_roi}", flush=True)
-                    location_worker.submit(frame_id=frame_id, frame_snapshot=native_ocr_frame)
-                    last_location_submit_t = now
-
-                location_seen_version, latest_location = location_worker.get_latest_since(location_seen_version)
-                if latest_location is not None:
-                    last_location_text = str(latest_location)
-                    LATEST_LOCATION_RESULT = last_location_text
-                    print(f"location={last_location_text}", flush=True)
+            # 定时 OCR 与定时位置识别已迁移到 decision_advisor.py 的终端命令模式。
 
             if out_writer is not None and out_writer.is_broken():
                 _log("stage=out_stream_broken_restart")

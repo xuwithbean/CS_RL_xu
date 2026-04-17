@@ -1,0 +1,5 @@
+[advisor] 共享模式: frame=/tmp/cs_rl_latest_frame.jpg state=/tmp/cs_rl_runtime_state.json
+[advisor] 未配置 API Key，pos 命令将只输出 OCR 信息。
+[advisor] 输入命令: ocr | pos | help | quit
+[advisor] 暂无可用帧，请稍后重试
+[advisor] exit
