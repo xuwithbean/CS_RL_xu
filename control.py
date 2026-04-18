@@ -179,6 +179,7 @@ VK_MAP = {
     "s": 0x53,
     "d": 0x44,
     " ": 0x20,
+    "space": 0x20,
     "ctrl": 0x11,
     "shift": 0x10,
     "alt": 0x12,
