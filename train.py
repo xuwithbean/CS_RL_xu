@@ -51,6 +51,7 @@ class SimpleCombatEnv:
 	def __init__(self, seed: int = 7):
 		self.rng = random.Random(seed)
 		self.max_ammo = 30
+		self.step_dt_sec = 0.20
 		self.reset()
 
 	def reset(self) -> dict[str, Any]:
@@ -59,9 +60,10 @@ class SimpleCombatEnv:
 		self.enemy_visible = self.rng.random() < 0.55
 		self.aim_error = self.rng.uniform(0.35, 0.95)
 		self.danger_level = self.rng.uniform(0.2, 0.7)
-		return self._get_obs(hit=0.0, kill=0.0, death=0.0)
+		self.fight_time_sec = 0.0
+		return self._get_obs(hit=0.0, kill=0.0, death=0.0, shot_fired=0.0, kill_time_sec=0.0)
 
-	def _get_obs(self, hit: float, kill: float, death: float) -> dict[str, Any]:
+	def _get_obs(self, hit: float, kill: float, death: float, shot_fired: float, kill_time_sec: float) -> dict[str, Any]:
 		enemy_distance = 0.3 + 0.7 * self.rng.random() if self.enemy_visible else 1.0
 		return {
 			"hp": max(0.0, min(100.0, self.hp)),
@@ -70,6 +72,9 @@ class SimpleCombatEnv:
 			"enemy_distance": max(0.0, min(1.0, enemy_distance)),
 			"aim_error": max(0.0, min(1.0, self.aim_error)),
 			"danger_level": max(0.0, min(1.0, self.danger_level)),
+			"fight_time_sec": max(0.0, float(self.fight_time_sec)),
+			"kill_time_sec": max(0.0, float(kill_time_sec)),
+			"shot_fired": max(0.0, float(shot_fired)),
 			"hit": hit,
 			"kill": kill,
 			"death": death,
@@ -79,12 +84,19 @@ class SimpleCombatEnv:
 		hit = 0.0
 		kill = 0.0
 		death = 0.0
+		shot_fired = 0.0
+		kill_time_sec = 0.0
 
 		# 视野变化
 		if manager_goal == "search":
 			self.enemy_visible = self.rng.random() < 0.75
 		else:
 			self.enemy_visible = self.rng.random() < 0.55
+
+		if self.enemy_visible:
+			self.fight_time_sec += float(self.step_dt_sec)
+		else:
+			self.fight_time_sec = 0.0
 
 		# 瞄准动作对误差的影响
 		if action_name in {"aim_left", "aim_right", "aim_up", "aim_down"}:
@@ -95,6 +107,7 @@ class SimpleCombatEnv:
 		# 射击逻辑
 		if action_name == "shoot" and self.ammo > 0:
 			self.ammo -= 1
+			shot_fired = 1.0
 			if self.enemy_visible:
 				hit_prob = max(0.05, 0.85 - self.aim_error)
 				if manager_goal == "fight":
@@ -104,6 +117,7 @@ class SimpleCombatEnv:
 					# 命中后有概率击杀
 					if self.rng.random() < 0.20 + 0.30 * (1.0 - self.aim_error):
 						kill = 1.0
+						kill_time_sec = float(self.fight_time_sec)
 
 		if action_name == "reload":
 			self.ammo = float(self.max_ammo)
@@ -129,8 +143,10 @@ class SimpleCombatEnv:
 			done = True
 		elif kill > 0.5:
 			done = True
+			if kill_time_sec <= 0.0:
+				kill_time_sec = float(self.fight_time_sec)
 
-		return self._get_obs(hit=hit, kill=kill, death=death), done
+		return self._get_obs(hit=hit, kill=kill, death=death, shot_fired=shot_fired, kill_time_sec=kill_time_sec), done
 
 
 def get_manager_goal(obs: dict[str, Any], step_idx: int, manager_interval: int) -> str:

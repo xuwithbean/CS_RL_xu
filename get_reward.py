@@ -39,14 +39,24 @@ def get_reward(
 	aim_improve = prev_aim - curr_aim
 
 	ammo_cost = max(0.0, float(prev_obs.get("ammo", 0.0)) - float(curr_obs.get("ammo", 0.0)))
+	shot_fired = float(curr_obs.get("shot_fired", ammo_cost))
+	hit_event = 1.0 if hit > 0.5 else 0.0
+	wasted_shot = max(0.0, shot_fired - hit_event)
+
+	# 击杀耗时（秒）：越快越好。
+	kill_time_sec = float(curr_obs.get("kill_time_sec", curr_obs.get("fight_time_sec", 0.0)))
+	# 4 秒内完成击杀可获得接近满额速度奖励，超过后奖励衰减到 0。
+	kill_speed = max(0.0, 1.0 - kill_time_sec / 4.0)
 	danger = float(curr_obs.get("danger_level", 0.0))
 
 	reward_items: dict[str, float] = {
 		"hit": 3.0 * hit,
 		"kill": 8.0 * kill,
+		"kill_speed": 2.5 * kill * kill_speed,
 		"death": -6.0 * death,
 		"aim": 0.8 * aim_improve,
-		"waste_fire": -0.2 * ammo_cost,
+		"waste_fire": -0.35 * wasted_shot,
+		"ammo_cost": -0.10 * ammo_cost,
 		"survive": 0.02,
 	}
 

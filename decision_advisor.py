@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import queue
 import sys
@@ -106,6 +107,86 @@ def get_read_shared_centers(state_path: str) -> list[tuple[str, int, int, float]
             )
         )
     return out
+
+
+def get_build_aim_target(
+    centers: list[tuple[str, int, int, float]],
+    frame_shape: tuple[int, int] | None,
+) -> dict[str, Any] | None:
+    """基于检测中心点选择主目标，并计算相对准星（画面中心）的误差。"""
+    if not centers or frame_shape is None:
+        return None
+
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    if h <= 0 or w <= 0:
+        return None
+
+    cx0 = w // 2
+    cy0 = h // 2
+
+    head_alias = {
+        "head",
+        "enemy_head",
+        "person_head",
+        "ct_head",
+        "t_head",
+    }
+    body_alias = {
+        "person",
+        "enemy",
+        "ct",
+        "t",
+        "body",
+    }
+
+    typed: list[tuple[str, int, int, float, str]] = []
+    for name, x, y, conf in centers:
+        lname = str(name or "").strip().lower()
+        if lname in head_alias or "head" in lname:
+            target_type = "head"
+        elif lname in body_alias:
+            target_type = "body"
+        else:
+            target_type = "other"
+        typed.append((str(name), int(x), int(y), float(conf), target_type))
+
+    def _pick(candidates: list[tuple[str, int, int, float, str]]) -> tuple[str, int, int, float, str] | None:
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda t: (
+                math.hypot(float(t[1] - cx0), float(t[2] - cy0)),
+                -float(t[3]),
+            ),
+        )
+
+    head_candidates = [c for c in typed if c[4] == "head"]
+    body_candidates = [c for c in typed if c[4] == "body"]
+    other_candidates = [c for c in typed if c[4] == "other"]
+
+    chosen = _pick(head_candidates) or _pick(body_candidates) or _pick(other_candidates)
+    if chosen is None:
+        return None
+
+    name, tx, ty, conf, target_type = chosen
+    dx = int(tx - cx0)
+    dy = int(ty - cy0)
+    norm = max(1.0, math.hypot(float(w) / 2.0, float(h) / 2.0))
+    aim_error = max(0.0, min(1.0, math.hypot(float(dx), float(dy)) / norm))
+
+    return {
+        "target_name": name,
+        "target_type": target_type,
+        "target_x": int(tx),
+        "target_y": int(ty),
+        "crosshair_x": int(cx0),
+        "crosshair_y": int(cy0),
+        "dx": int(dx),
+        "dy": int(dy),
+        "aim_error": float(aim_error),
+        "conf": float(conf),
+    }
 
 
 def get_start_stdin_thread(cmd_queue: "queue.Queue[str]") -> threading.Thread:
@@ -263,6 +344,12 @@ def main() -> int:
             signature = json.dumps(centers, ensure_ascii=False)
             if signature != last_enemy_signature:
                 print(f"yolo_centers={signature}", flush=True)
+                target_payload = get_build_aim_target(
+                    centers=centers,
+                    frame_shape=(latest_frame.shape[0], latest_frame.shape[1]) if latest_frame is not None else None,
+                )
+                if target_payload is not None:
+                    print(f"aim_target={json.dumps(target_payload, ensure_ascii=False)}", flush=True)
                 print("decision=enemy_visible suggestion=建议停止移动，优先瞄准并开火", flush=True)
                 last_enemy_signature = signature
 
