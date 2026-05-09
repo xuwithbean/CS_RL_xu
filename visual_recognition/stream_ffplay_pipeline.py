@@ -1316,6 +1316,8 @@ def get_write_shared_runtime_artifacts(
     centers: list[tuple[str, int, int, float]],
     frame_path: str,
     state_path: str,
+    centers_ref_w: int = 0,
+    centers_ref_h: int = 0,
 ) -> None:
     """写入跨进程共享数据：最新原生帧和最新中心点结果。"""
     if frame is not None and str(frame_path or "").strip():
@@ -1342,6 +1344,8 @@ def get_write_shared_runtime_artifacts(
 
         payload = {
             "ts": time.time(),
+            "centers_ref_w": int(max(0, int(centers_ref_w))),
+            "centers_ref_h": int(max(0, int(centers_ref_h))),
             "centers": [
                 {
                     "name": str(name),
@@ -1685,6 +1689,8 @@ def main() -> int:
                         centers=last_centers,
                         frame_path=shared_frame_path,
                         state_path=shared_state_path,
+                        centers_ref_w=int(out_w),
+                        centers_ref_h=int(out_h),
                     )
                 except Exception:
                     pass
