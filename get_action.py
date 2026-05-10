@@ -17,16 +17,11 @@ from typing import Any
 # 动作空间：可按需要扩展。
 ACTIONS: list[str] = [
 	"idle",
-	"move_forward",
-	"move_back",
-	"strafe_left",
-	"strafe_right",
 	"aim_left",
 	"aim_right",
 	"aim_up",
 	"aim_down",
 	"shoot",
-	"reload",
 ]
 
 
@@ -46,12 +41,15 @@ def _get_bin(value: float, thresholds: list[float]) -> int:
 def get_state_key(obs: dict[str, Any], manager_goal: str) -> tuple[Any, ...]:
 	"""将连续观测离散化为 Q 表键。"""
 	enemy_visible = int(bool(obs.get("enemy_visible", False)))
+	target_visible = int(bool(obs.get("target_visible", enemy_visible)))
 	aim_bin = _get_bin(float(obs.get("aim_error", 1.0)), [0.2, 0.45, 0.7])
+	target_dx_bin = _get_bin(abs(float(obs.get("target_dx", 0.0))), [0.08, 0.18, 0.35])
+	target_dy_bin = _get_bin(abs(float(obs.get("target_dy", 0.0))), [0.08, 0.18, 0.35])
 	hp_bin = _get_bin(float(obs.get("hp", 100.0)) / 100.0, [0.2, 0.45, 0.7])
 	ammo_bin = _get_bin(float(obs.get("ammo", 30.0)) / 30.0, [0.15, 0.35, 0.7])
 	danger_bin = _get_bin(float(obs.get("danger_level", 0.0)), [0.25, 0.5, 0.75])
 
-	return (manager_goal, enemy_visible, aim_bin, hp_bin, ammo_bin, danger_bin)
+	return (manager_goal, target_visible, enemy_visible, target_dx_bin, target_dy_bin, aim_bin, hp_bin, ammo_bin, danger_bin)
 
 
 def get_action(
@@ -92,15 +90,10 @@ def get_action_command(action_name: str) -> dict[str, Any]:
 	"""将动作名映射为控制层命令（先给出统一格式，后续接真实控制）。"""
 	mapping: dict[str, dict[str, Any]] = {
 		"idle": {"keys": [], "mouse": (0, 0), "shoot": False},
-		"move_forward": {"keys": ["w"], "mouse": (0, 0), "shoot": False},
-		"move_back": {"keys": ["s"], "mouse": (0, 0), "shoot": False},
-		"strafe_left": {"keys": ["a"], "mouse": (0, 0), "shoot": False},
-		"strafe_right": {"keys": ["d"], "mouse": (0, 0), "shoot": False},
 		"aim_left": {"keys": [], "mouse": (-8, 0), "shoot": False},
 		"aim_right": {"keys": [], "mouse": (8, 0), "shoot": False},
 		"aim_up": {"keys": [], "mouse": (0, -6), "shoot": False},
 		"aim_down": {"keys": [], "mouse": (0, 6), "shoot": False},
 		"shoot": {"keys": [], "mouse": (0, 0), "shoot": True},
-		"reload": {"keys": ["r"], "mouse": (0, 0), "shoot": False},
 	}
 	return mapping.get(action_name, mapping["idle"]) 

@@ -399,7 +399,7 @@ try {
                     'SLEEP' { Start-Sleep -Milliseconds ([int]$parts[1]); $sw.WriteLine('OK') }
                     'KEY_DOWN' { [KE.WinAPI]::keybd_event([byte][int]$parts[1],0,0,[UIntPtr]::Zero); $sw.WriteLine('OK') }
                     'KEY_UP' { [KE.WinAPI]::keybd_event([byte][int]$parts[1],0,2,[UIntPtr]::Zero); $sw.WriteLine('OK') }
-                    'MOUSE_MOVE' { [KE.WinAPI]::mouse_event(0x0001, [uint32][int]$parts[1], [uint32][int]$parts[2], 0, [UIntPtr]::Zero); $sw.WriteLine('OK') }
+                    'MOUSE_MOVE' { [KE.WinAPI]::mouse_event(0x0001, [int]$parts[1], [int]$parts[2], 0, [UIntPtr]::Zero); $sw.WriteLine('OK') }
                     'MOUSE_PRESS' {
                         switch ($parts[1].ToLower()) {
                             'left' { [KE.WinAPI]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero) }

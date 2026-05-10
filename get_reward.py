@@ -67,19 +67,20 @@ def get_reward(
 		"time_penalty": -0.01 * max(0.0, float(curr_obs.get("fight_time_sec", 0.0))),
 	}
 
-	if kill_confirmed and no_target_time_sec >= 1.5:
-		reward_items["kill_confirm_bonus"] = 4.0
-	elif no_target_time_sec > 0.0:
-		reward_items["kill_confirm_bonus"] = 0.5 * min(1.0, no_target_time_sec / 1.5)
+	# 点瞄准任务里不要鼓励“让目标消失”，否则策略会学会低头/躲开。
+	# 只有真实命中或击杀时才给一点确认奖励。
+	if kill_confirmed and (hit_event > 0.5 or kill > 0.5):
+		reward_items["kill_confirm_bonus"] = 0.5
 	else:
 		reward_items["kill_confirm_bonus"] = 0.0
 
+	if no_target_time_sec > 0.0 and not kill_confirmed:
+		reward_items["hide_penalty"] = -0.2 * min(1.0, no_target_time_sec / 1.5)
+	else:
+		reward_items["hide_penalty"] = 0.0
+
 	# 子目标一致性奖励：鼓励短期动作配合长期决策。
-	if manager_goal == "take_cover":
-		reward_items["goal_align"] = 0.4 * max(0.0, danger - float(curr_obs.get("danger_level", danger)))
-		if action_name in {"move_back", "strafe_left", "strafe_right"}:
-			reward_items["goal_align"] += 0.15
-	elif manager_goal == "fight":
+	if str(manager_goal).startswith("fight"):
 		reward_items["goal_align"] = 0.25 * hit + 0.15 * max(0.0, aim_improve) + 0.15 * center_lock
 		if action_name == "shoot":
 			reward_items["goal_align"] += 0.05

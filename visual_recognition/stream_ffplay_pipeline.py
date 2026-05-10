@@ -556,32 +556,62 @@ def get_family_exclusive_boxes(
     boxes: list[tuple[int, int, int, int, float, str]],
     conflict_iou: float,
 ) -> list[tuple[int, int, int, int, float, str]]:
-    """同一区域 CT/T 系列互斥：保留高置信度框。"""
+    """同一区域 CT/T 系列互斥：每个家族仅保留一个 body 和一个 head。"""
     if not boxes:
         return boxes
 
     thr = max(0.0, min(1.0, float(conflict_iou)))
     kept: list[tuple[int, int, int, int, float, str]] = []
 
-    for item in sorted(boxes, key=lambda x: float(x[4]), reverse=True):
-        x1, y1, x2, y2, conf, name = item
-        fam = get_class_family(name)
-        if fam not in {"CT", "T"}:
-            kept.append(item)
+    def _box_center_inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:
+        ix1, iy1, ix2, iy2 = inner
+        ox1, oy1, ox2, oy2 = outer
+        cx = (ix1 + ix2) / 2.0
+        cy = (iy1 + iy2) / 2.0
+        return ox1 <= cx <= ox2 and oy1 <= cy <= oy2
+
+    family_groups: dict[str, dict[str, list[tuple[int, int, int, int, float, str]]]] = {
+        "CT": {"body": [], "head": []},
+        "T": {"body": [], "head": []},
+    }
+
+    others: list[tuple[int, int, int, int, float, str]] = []
+    for item in boxes:
+        fam = get_class_family(item[5])
+        name = str(item[5]).upper()
+        if fam not in family_groups:
+            others.append(item)
+            continue
+        if "HEAD" in name:
+            family_groups[fam]["head"].append(item)
+        else:
+            family_groups[fam]["body"].append(item)
+
+    for fam in ("CT", "T"):
+        bodies = sorted(family_groups[fam]["body"], key=lambda x: float(x[4]), reverse=True)
+        heads = sorted(family_groups[fam]["head"], key=lambda x: float(x[4]), reverse=True)
+        if not bodies:
             continue
 
-        blocked = False
-        for k in kept:
-            kfam = get_class_family(k[5])
-            if kfam == fam or kfam == "OTHER":
-                continue
-            iou = get_iou((x1, y1, x2, y2), (k[0], k[1], k[2], k[3]))
-            if iou >= thr:
-                blocked = True
-                break
+        body = bodies[0]
+        kept.append(body)
 
-        if not blocked:
-            kept.append(item)
+        body_rect = (body[0], body[1], body[2], body[3])
+        chosen_head = None
+        for head in heads:
+            if _box_center_inside((head[0], head[1], head[2], head[3]), body_rect):
+                chosen_head = head
+                break
+        if chosen_head is None:
+            for head in heads:
+                iou = get_iou(body_rect, (head[0], head[1], head[2], head[3]))
+                if iou >= thr:
+                    chosen_head = head
+                    break
+        if chosen_head is not None:
+            kept.append(chosen_head)
+
+    kept.extend(others)
 
     return kept
 
