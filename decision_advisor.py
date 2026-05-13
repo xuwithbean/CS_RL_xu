@@ -227,6 +227,60 @@ def get_run_ocr_and_print(
     return ocr_results, ocr_text
 
 
+def get_query_kill_count_from_frame(
+    cv2,
+    frame,
+    qwen_client: Optional[get_qwen_location_client],
+    roi_rel: tuple[float, float, float, float],
+    summary_text: str,
+) -> dict[str, Any]:
+    if qwen_client is None or frame is None:
+        return {"kill_count": 0, "reason": "qwen_client_unavailable"}
+
+    image_data_url = get_build_image_data_url_from_frame(cv2, frame, roi_rel)
+    try:
+        response = qwen_client.client.chat.completions.create(
+            model=qwen_client.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "你是CS击杀计数助手。请根据截图和状态读取当前累计击杀数。"
+                                "只输出JSON，不要输出额外解释，格式必须是："
+                                "{\"kill_count\": 非负整数, \"reason\": \"一句话原因\"}。"
+                                "kill_count 必须表示当前总击杀数，不要判断是否击杀。\n"
+                                f"当前状态：{summary_text}\n"
+                                "请严格按JSON返回。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url},
+                        },
+                    ],
+                },
+            ],
+            extra_body={"enable_thinking": False},
+            stream=False,
+        )
+        raw_text = str((response.choices[0].message.content or "").strip())
+        try:
+            payload = json.loads(raw_text)
+            if not isinstance(payload, dict):
+                raise ValueError("kill count payload is not a dict")
+        except Exception:
+            payload = {"kill_count": 0, "reason": raw_text}
+
+        payload["kill_count"] = int(max(0, int(payload.get("kill_count", 0))))
+        payload["reason"] = str(payload.get("reason", raw_text) or "")
+        return payload
+    except Exception as exc:
+        return {"kill_count": 0, "reason": f"error:{type(exc).__name__}:{exc}"}
+
+
 def main() -> int:
     args = get_args()
     cv2 = get_load_cv2()

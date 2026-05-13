@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import random
 import signal
@@ -13,10 +14,12 @@ from typing import Any
 import numpy as np
 
 from actions import m_actions
+from decision_advisor import get_query_kill_count_from_frame
 from find_enemy import get_enemy_feedback
 from get_action import get_action_command
 from get_reward import get_reward
 from td3_agent import ReplayBuffer, TD3Agent
+from visual_recognition.stream_ffplay_pipeline import get_qwen_location_client, get_resolve_qwen_api_key
 
 
 GOALS = ["search", "fight", "take_cover"]
@@ -369,22 +372,18 @@ class SharedPointEnv:
 			self._lost_since = now
 
 		no_target_time_sec = 0.0 if self._lost_since is None else now - self._lost_since
-		kill = 0.0
-		kill_time_sec = 0.0
 		fight_time_sec = 0.0 if self._visible_since is None else now - self._visible_since
-		if self._visible_since is not None and no_target_time_sec >= self.target_disappear_sec:
-			self._kill_confirmed = True
-			kill = 1.0
-			kill_time_sec = fight_time_sec
+		# 点流模式下，目标消失只表示视野丢失，不再当作击杀成功。
+		self._kill_confirmed = False
 
 		return self._make_obs(
 			visible=False,
 			center_error=center_error,
 			fight_time_sec=fight_time_sec,
-			kill_time_sec=kill_time_sec,
+			kill_time_sec=0.0,
 			no_target_time_sec=no_target_time_sec,
 			hit=0.0,
-			kill=kill,
+			kill=0.0,
 			death=0.0,
 			shot_fired=self._shot_fired,
 		)
@@ -702,6 +701,48 @@ def _should_update_on_obs(obs: dict[str, Any]) -> bool:
 	return bool(obs.get("target_visible", obs.get("enemy_visible", False)))
 
 
+def _build_llm_kill_counter(shared_frame_path: str) -> Any | None:
+	qwen_api_key = get_resolve_qwen_api_key("")
+	if not qwen_api_key:
+		return None
+	try:
+		cv2 = importlib.import_module("cv2")
+	except Exception:
+		return None
+	try:
+		qwen_client = get_qwen_location_client(api_key=qwen_api_key, model="qwen3.6-plus")
+	except Exception:
+		return None
+
+	def _query(prev_obs: dict[str, Any], curr_obs: dict[str, Any], action_name: str, manager_goal: str) -> dict[str, Any]:
+		frame = None
+		path = str(shared_frame_path or "").strip()
+		if path:
+			frame = cv2.imread(path)
+		summary_text = (
+			f"prev_visible={bool(prev_obs.get('target_visible', prev_obs.get('enemy_visible', False)))}; "
+			f"curr_visible={bool(curr_obs.get('target_visible', curr_obs.get('enemy_visible', False)))}; "
+			f"aim_error={float(curr_obs.get('aim_error', 1.0)):.4f}; "
+			f"target_dx={float(curr_obs.get('target_dx', 0.0)):.4f}; "
+			f"target_dy={float(curr_obs.get('target_dy', 0.0)):.4f}; "
+			f"no_target_time_sec={float(curr_obs.get('no_target_time_sec', 0.0)):.4f}; "
+			f"action={action_name}; goal={manager_goal}"
+		)
+		if frame is None:
+			return {"kill_count": 0, "reason": "shared_frame_missing"}
+
+		count_payload = get_query_kill_count_from_frame(cv2, frame, qwen_client, (0.0, 0.0, 1.0, 1.0), summary_text)
+		try:
+			current_count = int(max(0, int(count_payload.get("kill_count", 0))))
+		except Exception:
+			current_count = 0
+
+		# 返回当前累计击杀数，由 reward 层做差值判断本次是否新增击杀。
+		return {"kill_count": int(current_count), "reason": count_payload.get("reason", "")}
+
+	return _query
+
+
 def train_loop(cfg: TrainConfig) -> None:
 	random.seed(cfg.seed)
 	np.random.seed(cfg.seed)
@@ -712,6 +753,7 @@ def train_loop(cfg: TrainConfig) -> None:
 	best_episode_idx = 0
 	best_reward_kpm = 0.0
 	controller = m_actions() if (cfg.apply_actions or cfg.env_mode != "smoke") else None
+	llm_kill_counter = _build_llm_kill_counter(cfg.shared_frame_path) if cfg.env_mode != "smoke" else None
 	stop_requested = False
 	checkpoint_path = str(cfg.load_path or cfg.save_path)
 	loaded_agent: TD3Agent | None = None
@@ -775,11 +817,14 @@ def train_loop(cfg: TrainConfig) -> None:
 			f"start_steps={cfg.start_steps} updates_per_step={cfg.updates_per_step} move_gain={cfg.move_gain} max_step={cfg.max_step}",
 			flush=True,
 		)
+		if llm_kill_counter is not None:
+			print("[train] LLM kill counter=enabled", flush=True)
 
 		for ep in range(current_episode + 1, cfg.episodes + 1):
 			episode_start = time.monotonic()
 			obs = env.reset()
 			goal = "search"
+			kill_count_state = {"last_kill_count": 0}
 			ep_reward = 0.0
 			ep_base_reward = 0.0
 			ep_hit = 0.0
@@ -818,11 +863,18 @@ def train_loop(cfg: TrainConfig) -> None:
 						controller.mouse_click(hold_sec=0.03)
 
 				next_obs, done = env.step(action_name, goal)
-				reward, _reward_items = get_reward(worker_obs, next_obs, action_name, goal)
+				reward, _reward_items = get_reward(
+					worker_obs,
+					next_obs,
+					action_name,
+					goal,
+					kill_count_reader=llm_kill_counter,
+					kill_count_state=kill_count_state,
+				)
 				ep_reward += reward
 				ep_base_reward += reward
 				ep_hit += float(next_obs.get("hit", 0.0))
-				ep_kill += float(next_obs.get("kill", 0.0))
+				ep_kill += float(_reward_items.get("llm_kill_delta", _reward_items.get("kill", 0.0)))
 				ep_death += float(next_obs.get("death", 0.0))
 
 				next_enemy_feedback = get_enemy_feedback(next_obs)

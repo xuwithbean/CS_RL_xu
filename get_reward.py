@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 
 def get_reward(
@@ -17,6 +17,8 @@ def get_reward(
 	curr_obs: dict[str, Any],
 	action_name: str,
 	manager_goal: str,
+	kill_count_reader: Callable[[dict[str, Any], dict[str, Any], str, str], dict[str, Any] | None] | None = None,
+	kill_count_state: dict[str, Any] | None = None,
 ) -> tuple[float, dict[str, float]]:
 	"""计算一步奖励。
 
@@ -49,6 +51,21 @@ def get_reward(
 	kill_time_sec = float(curr_obs.get("kill_time_sec", curr_obs.get("fight_time_sec", 0.0)))
 	no_target_time_sec = float(curr_obs.get("no_target_time_sec", 0.0))
 	kill_confirmed = bool(curr_obs.get("kill_confirmed", False)) or kill > 0.5
+	prev_visible = bool(prev_obs.get("target_visible", prev_obs.get("enemy_visible", False)))
+	curr_visible = bool(curr_obs.get("target_visible", curr_obs.get("enemy_visible", False)))
+	llm_kill_count = int(max(0, float((kill_count_state or {}).get("last_kill_count", 0))))
+	llm_kill_delta = 0.0
+	if prev_visible and not curr_visible and not kill_confirmed and kill_count_reader is not None:
+		count_payload = kill_count_reader(prev_obs, curr_obs, action_name, manager_goal) or {}
+		current_kill_count = int(max(0, int(count_payload.get("kill_count", 0))))
+		previous_kill_count = int(max(0, int((kill_count_state or {}).get("last_kill_count", 0))))
+		llm_kill_delta = float(max(0, current_kill_count - previous_kill_count))
+		llm_kill_count = int(current_kill_count)
+		if kill_count_state is not None:
+			kill_count_state["last_kill_count"] = int(current_kill_count)
+		if llm_kill_delta > 0:
+			kill = max(kill, llm_kill_delta)
+			kill_confirmed = True
 	# 4 秒内完成击杀可获得接近满额速度奖励，超过后奖励衰减到 0。
 	kill_speed = max(0.0, 1.0 - kill_time_sec / 4.0)
 	danger = float(curr_obs.get("danger_level", 0.0))
@@ -59,8 +76,9 @@ def get_reward(
 		"kill_speed": 3.0 * kill * kill_speed,
 		"death": -6.0 * death,
 		"aim": 0.8 * aim_improve,
-		"center_lock": 0.75 * center_lock,
-		"center_snap": 1.5 * center_snap,
+		"center_lock": 1.15 * center_lock,
+		"center_snap": 2.10 * center_snap,
+		"center_track": 0.90 * max(0.0, aim_improve),
 		"waste_fire": -0.50 * wasted_shot,
 		"ammo_cost": -0.15 * ammo_cost,
 		"survive": 0.01,
@@ -73,9 +91,11 @@ def get_reward(
 		reward_items["kill_confirm_bonus"] = 0.5
 	else:
 		reward_items["kill_confirm_bonus"] = 0.0
+	reward_items["llm_kill_count"] = float(llm_kill_count)
+	reward_items["llm_kill_delta"] = float(llm_kill_delta)
 
 	if no_target_time_sec > 0.0 and not kill_confirmed:
-		reward_items["hide_penalty"] = -0.2 * min(1.0, no_target_time_sec / 1.5)
+		reward_items["hide_penalty"] = -0.8 * min(1.0, no_target_time_sec / 1.5)
 	else:
 		reward_items["hide_penalty"] = 0.0
 
@@ -91,6 +111,12 @@ def get_reward(
 
 	if kill_confirmed:
 		reward_items["goal_align"] += 0.5
+
+	# 目标一旦消失，额外惩罚，明确压制“甩出画面”这种策略。
+	if no_target_time_sec > 0.0:
+		reward_items["lost_target_penalty"] = -0.6 * min(1.0, no_target_time_sec / 1.5)
+	else:
+		reward_items["lost_target_penalty"] = 0.0
 
 	total_reward = float(sum(reward_items.values()))
 	return total_reward, reward_items
