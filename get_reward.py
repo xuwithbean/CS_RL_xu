@@ -41,6 +41,7 @@ def get_reward(
 	aim_improve = prev_aim - curr_aim
 	center_lock = max(0.0, 1.0 - curr_aim)
 	center_snap = max(0.0, 0.15 - curr_aim)
+	centered = curr_aim <= 0.02
 
 	ammo_cost = max(0.0, float(prev_obs.get("ammo", 0.0)) - float(curr_obs.get("ammo", 0.0)))
 	shot_fired = float(curr_obs.get("shot_fired", ammo_cost))
@@ -71,14 +72,14 @@ def get_reward(
 	danger = float(curr_obs.get("danger_level", 0.0))
 
 	reward_items: dict[str, float] = {
-		"hit": 3.0 * hit,
-		"kill": 10.0 * kill,
-		"kill_speed": 3.0 * kill * kill_speed,
+		"hit": 3.2 * hit,
+		"kill": 14.0 * kill,
+		"kill_speed": 4.0 * kill * kill_speed,
 		"death": -6.0 * death,
-		"aim": 0.8 * aim_improve,
-		"center_lock": 1.15 * center_lock,
-		"center_snap": 2.10 * center_snap,
-		"center_track": 0.90 * max(0.0, aim_improve),
+		"aim": 3.00 * aim_improve,
+		"center_lock": 3.50 * center_lock,
+		"center_snap": 5.00 * center_snap,
+		"center_track": 2.50 * max(0.0, aim_improve),
 		"waste_fire": -0.50 * wasted_shot,
 		"ammo_cost": -0.15 * ammo_cost,
 		"survive": 0.01,
@@ -91,6 +92,30 @@ def get_reward(
 		reward_items["kill_confirm_bonus"] = 0.5
 	else:
 		reward_items["kill_confirm_bonus"] = 0.0
+	if action_name == "shoot":
+		if centered:
+			reward_items["center_shot_bonus"] = 4.0
+			reward_items["early_shot_penalty"] = 0.0
+		else:
+			reward_items["center_shot_bonus"] = 0.0
+			reward_items["early_shot_penalty"] = -0.4 * min(1.0, curr_aim / 0.35)
+	else:
+		reward_items["center_shot_bonus"] = 0.0
+		reward_items["center_hold_penalty"] = -0.35 if (curr_visible and centered) else 0.0
+		reward_items["early_shot_penalty"] = 0.0
+
+	if curr_visible and not centered:
+		reward_items["aim_miss_penalty"] = -1.2 * min(1.0, curr_aim / 0.5)
+		if action_name == "idle":
+			reward_items["idle_while_aiming_penalty"] = -0.9 * min(1.0, curr_aim / 0.5)
+		elif action_name.startswith("aim_"):
+			reward_items["aim_move_bonus"] = 0.80 * max(0.0, aim_improve)
+		else:
+			reward_items["aim_move_bonus"] = 0.0
+	else:
+		reward_items["aim_miss_penalty"] = 0.0
+		reward_items["idle_while_aiming_penalty"] = 0.0
+		reward_items["aim_move_bonus"] = 0.0
 	reward_items["llm_kill_count"] = float(llm_kill_count)
 	reward_items["llm_kill_delta"] = float(llm_kill_delta)
 
@@ -101,9 +126,11 @@ def get_reward(
 
 	# 子目标一致性奖励：鼓励短期动作配合长期决策。
 	if str(manager_goal).startswith("fight"):
-		reward_items["goal_align"] = 0.25 * hit + 0.15 * max(0.0, aim_improve) + 0.15 * center_lock
+		reward_items["goal_align"] = 0.35 * hit + 0.38 * max(0.0, aim_improve) + 0.30 * center_lock
 		if action_name == "shoot":
-			reward_items["goal_align"] += 0.05
+			reward_items["goal_align"] += 0.12
+		if centered and action_name != "shoot":
+			reward_items["goal_align"] -= 0.08
 	elif manager_goal == "search":
 		reward_items["goal_align"] = 0.1 if curr_obs.get("enemy_visible", False) else 0.02
 	else:

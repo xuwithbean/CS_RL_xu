@@ -47,7 +47,7 @@ class TrainConfig:
 	best_reward_plot_path: str = ""
 	reward_plot_every: int = 100
 	reward_kpm_weight: float = 0.05
-	move_gain: float = 300.0
+	move_gain: float = 400.0
 	max_step: int = 400
 	batch_size: int = 128
 	replay_size: int = 50000
@@ -58,9 +58,22 @@ class TrainConfig:
 	policy_delay: int = 2
 	tau: float = 0.005
 	exploration_noise: float = 0.15
-	shoot_threshold: float = 0.35
-	shoot_center_error: float = 0.055
+	shoot_threshold: float = 0.12
+	shoot_center_error: float = 0.04
+	use_proportional_control: bool = False
+	invert_x: bool = False
+	invert_y: bool = False
 	checkpoint_every: int = 10
+	qwen_api_key: str = ""
+	no_target_search_step: int = 16
+	no_target_search_interval_sec: float = 1.0
+	stream_delay_sec: float = 1.0
+	auto_measure_stream_delay: bool = True
+	delay_measure_trials: int = 3
+	delay_measure_move_px: int = 220
+	delay_measure_min_shift: float = 0.06
+	delay_measure_timeout_sec: float = 3.0
+	delay_measure_poll_sec: float = 0.03
 
 
 class SimpleCombatEnv:
@@ -173,8 +186,8 @@ class SimpleCombatEnv:
 class SharedPointEnv:
 	"""基于 `trainimg.py` 共享点流的训练环境。
 
-	该环境读取共享状态中的中心点坐标，把“点是否存在、离中心有多远、消失持续多久”
-	转换成训练观测。当前默认把点消失持续 `target_disappear_sec` 秒视为击杀成功。
+	该环境读取共享状态中的中心点坐标，把“点是否存在、离中心有多远、消失持续多久"
+	转换成训练观测。点消失仅表示丢失目标，不直接记为击杀。
 	"""
 
 	def __init__(
@@ -183,12 +196,14 @@ class SharedPointEnv:
 		shared_frame_path: str,
 		target_disappear_sec: float = 1.5,
 		step_dt_sec: float = 0.03,
+		stream_delay_sec: float = 1.0,
 		target_family: str = "MIXED",
 	):
 		self.shared_state_path = str(shared_state_path)
 		self.shared_frame_path = str(shared_frame_path)
 		self.target_disappear_sec = max(0.1, float(target_disappear_sec))
 		self.step_dt_sec = max(0.01, float(step_dt_sec))
+		self.stream_delay_sec = max(0.0, float(stream_delay_sec))
 		self.target_family = str(target_family or "MIXED").upper()
 		self.max_ammo = 30
 		self.rng = random.Random(7)
@@ -196,6 +211,8 @@ class SharedPointEnv:
 		self._lost_since: float | None = None
 		self._last_target_signature = ""
 		self._last_target_visible = False
+		self._tracked_target_name: str | None = None
+		self._tracked_target_ref: tuple[int, int] | None = None
 		self._kill_confirmed = False
 		self._ammo = float(self.max_ammo)
 		self._shot_fired = 0.0
@@ -217,8 +234,8 @@ class SharedPointEnv:
 		except Exception:
 			return {}
 
-	@staticmethod
-	def _pick_target(
+	def _select_target(
+		self,
 		centers: list[tuple[str, int, int, float]],
 		ref_w: int,
 		ref_h: int,
@@ -241,6 +258,20 @@ class SharedPointEnv:
 		for name, x, y, conf in centers:
 			typed.append((str(name), int(x), int(y), float(conf), _target_type(name)))
 
+		if self._tracked_target_name:
+			locked = [c for c in typed if c[0] == self._tracked_target_name]
+			if locked:
+				ref_pos = self._tracked_target_ref
+				if ref_pos is None:
+					ref_pos = (int(cx0), int(cy0))
+				return min(
+					locked,
+					key=lambda t: (
+						((float(t[1]) - float(ref_pos[0])) ** 2 + (float(t[2]) - float(ref_pos[1])) ** 2) ** 0.5,
+						-float(t[3]),
+					),
+				)[:4]
+
 		def _pick(cands: list[tuple[str, int, int, float, str]]) -> tuple[str, int, int, float, str] | None:
 			if not cands:
 				return None
@@ -255,6 +286,8 @@ class SharedPointEnv:
 		chosen = _pick([c for c in typed if c[4] == "head"]) or _pick([c for c in typed if c[4] == "body"]) or _pick([c for c in typed if c[4] == "other"])
 		if chosen is None:
 			return None
+		self._tracked_target_name = str(chosen[0])
+		self._tracked_target_ref = (int(chosen[1]), int(chosen[2]))
 		return chosen[:4]
 
 	def _make_obs(
@@ -298,6 +331,8 @@ class SharedPointEnv:
 		self._lost_since = None
 		self._last_target_signature = ""
 		self._last_target_visible = False
+		self._tracked_target_name = None
+		self._tracked_target_ref = None
 		self._kill_confirmed = False
 		self._ammo = float(self.max_ammo)
 		self._shot_fired = 0.0
@@ -323,7 +358,7 @@ class SharedPointEnv:
 			ref_h = 720
 
 		now = time.monotonic()
-		target = self._pick_target(centers, ref_w, ref_h)
+		target = self._select_target(centers, ref_w, ref_h)
 		visible = target is not None
 		center_error = 1.0
 		if target is not None:
@@ -343,6 +378,8 @@ class SharedPointEnv:
 			self._last_target_name = None
 			self._last_target_dx = 0.0
 			self._last_target_dy = 0.0
+			self._tracked_target_name = None
+			self._tracked_target_ref = None
 
 		if visible:
 			if not self._last_target_visible:
@@ -395,11 +432,15 @@ class SharedPointEnv:
 		elif action_name == "reload":
 			self._ammo = float(self.max_ammo)
 
-		# 给外部控制与点流更新留出时间。
+		# 按基础步频采样；动作-反馈延迟由训练循环中的延迟对齐队列处理。
 		time.sleep(self.step_dt_sec)
 		obs = self._observe()
 		done = bool(obs.get("kill", 0.0) > 0.5 or obs.get("death", 0.0) > 0.5)
 		return obs, done
+
+	def get_observation(self) -> dict[str, Any]:
+		"""无动作采样当前共享观测，用于延迟测量与调试。"""
+		return self._observe(force_refresh=True)
 
 
 def get_manager_goal(obs: dict[str, Any], step_idx: int, manager_interval: int) -> str:
@@ -547,7 +588,7 @@ def get_train_config_from_args() -> TrainConfig:
 	parser.add_argument("--best-reward-plot-path", type=str, default="", help="最佳模型对应 reward 图路径；为空则自动生成 *_best.png")
 	parser.add_argument("--reward-plot-every", type=int, default=100, help="每多少轮更新一次 reward/KPM 曲线图")
 	parser.add_argument("--reward-kpm-weight", type=float, default=0.05, help="将 KPM 作为 episode 级奖励加成的权重")
-	parser.add_argument("--move-gain", type=float, default=300.0, help="连续动作映射到鼠标像素位移的缩放倍数")
+	parser.add_argument("--move-gain", type=float, default=400.0, help="连续动作映射到鼠标像素位移的缩放倍数")
 	parser.add_argument("--max-step", type=int, default=400, help="直接瞄准时单步鼠标移动的最大绝对值")
 	parser.add_argument("--batch-size", type=int, default=128, help="TD3 每次更新的 batch size")
 	parser.add_argument("--replay-size", type=int, default=50000, help="TD3 回放池容量")
@@ -558,9 +599,24 @@ def get_train_config_from_args() -> TrainConfig:
 	parser.add_argument("--policy-delay", type=int, default=2, help="TD3 actor 更新延迟步数")
 	parser.add_argument("--tau", type=float, default=0.005, help="TD3 软更新系数")
 	parser.add_argument("--exploration-noise", type=float, default=0.15, help="TD3 动作探索噪声")
-	parser.add_argument("--shoot-threshold", type=float, default=0.35, help="动作输出中触发开火的阈值")
-	parser.add_argument("--shoot-center-error", type=float, default=0.055, help="只有在准星接近中心时才允许开火")
+	parser.add_argument("--shoot-threshold", type=float, default=0.12, help="动作输出中触发开火的阈值")
+	parser.add_argument("--shoot-center-error", type=float, default=0.04, help="只有在准星接近中心时才允许开火")
+	parser.add_argument("--proportional-control", action="store_true", help="使用简单的比例控制：直接把 target_dx/target_dy 线性映射为鼠标移动量并在靠近中心时自动开火")
+	parser.add_argument("--invert-x", action="store_true", help="反转横轴动作（用于调试方向不一致时启用）")
+	parser.add_argument("--invert-y", action="store_true", help="反转纵轴动作（用于调试方向不一致时启用）")
 	parser.add_argument("--checkpoint-every", type=int, default=10, help="每多少轮保存一次当前 checkpoint")
+	parser.add_argument("--qwen-api-key", type=str, default="", help="可选：显式传入 Qwen API Key（不传则读环境变量）")
+	parser.add_argument("--no-target-search-step", type=int, default=16, help="无目标时随机搜索鼠标位移半径")
+	parser.add_argument("--no-target-search-interval-sec", type=float, default=1.0, help="无目标时随机搜索的间隔秒数")
+	parser.add_argument("--stream-delay-sec", type=float, default=1.0, help="共享视频流的观测延迟，单位秒")
+	parser.add_argument("--auto-measure-stream-delay", action="store_true", help="训练开始前自动测量视频流延迟")
+	parser.add_argument("--no-auto-measure-stream-delay", dest="auto_measure_stream_delay", action="store_false", help="关闭训练前自动测量视频流延迟")
+	parser.set_defaults(auto_measure_stream_delay=True)
+	parser.add_argument("--delay-measure-trials", type=int, default=3, help="视频流延迟测量的重复次数")
+	parser.add_argument("--delay-measure-move-px", type=int, default=220, help="视频流延迟测量时的鼠标位移像素")
+	parser.add_argument("--delay-measure-min-shift", type=float, default=0.06, help="判定点大幅移动的最小归一化位移")
+	parser.add_argument("--delay-measure-timeout-sec", type=float, default=3.0, help="单次延迟测量超时秒数")
+	parser.add_argument("--delay-measure-poll-sec", type=float, default=0.03, help="延迟测量采样间隔秒数")
 	args = parser.parse_args()
 	best_save_path = str(args.best_save_path or "").strip() or _get_default_best_model_path(str(args.save_path))
 	best_reward_plot_path = str(args.best_reward_plot_path or "").strip() or _get_default_best_plot_path(str(args.reward_plot_path))
@@ -595,7 +651,20 @@ def get_train_config_from_args() -> TrainConfig:
 		exploration_noise=float(args.exploration_noise),
 		shoot_threshold=float(args.shoot_threshold),
 		shoot_center_error=float(args.shoot_center_error),
+		use_proportional_control=bool(getattr(args, "proportional_control", False)),
+		invert_x=bool(getattr(args, "invert_x", False)),
+		invert_y=bool(getattr(args, "invert_y", False)),
 		checkpoint_every=max(1, int(args.checkpoint_every)),
+		qwen_api_key=str(args.qwen_api_key or "").strip(),
+		no_target_search_step=max(0, int(args.no_target_search_step)),
+		no_target_search_interval_sec=max(0.1, float(args.no_target_search_interval_sec)),
+		stream_delay_sec=max(0.0, float(args.stream_delay_sec)),
+		auto_measure_stream_delay=bool(args.auto_measure_stream_delay),
+		delay_measure_trials=max(1, int(args.delay_measure_trials)),
+		delay_measure_move_px=max(30, int(args.delay_measure_move_px)),
+		delay_measure_min_shift=max(0.01, float(args.delay_measure_min_shift)),
+		delay_measure_timeout_sec=max(0.5, float(args.delay_measure_timeout_sec)),
+		delay_measure_poll_sec=max(0.01, float(args.delay_measure_poll_sec)),
 		target_family=str(args.target_family or "MIXED").upper(),
 		resume=bool(args.resume),
 		load_path=str(args.load_path or "").strip(),
@@ -611,6 +680,7 @@ def _make_env(cfg: TrainConfig) -> Any:
 			shared_frame_path=cfg.shared_frame_path,
 			target_disappear_sec=cfg.target_disappear_sec,
 			step_dt_sec=cfg.step_dt_sec,
+			stream_delay_sec=cfg.stream_delay_sec,
 			target_family=cfg.target_family,
 		)
 	if Path(cfg.shared_state_path).exists() and Path(cfg.shared_frame_path).exists():
@@ -619,6 +689,7 @@ def _make_env(cfg: TrainConfig) -> Any:
 			shared_frame_path=cfg.shared_frame_path,
 			target_disappear_sec=cfg.target_disappear_sec,
 			step_dt_sec=cfg.step_dt_sec,
+			stream_delay_sec=cfg.stream_delay_sec,
 			target_family=cfg.target_family,
 		)
 	return SimpleCombatEnv(seed=cfg.seed)
@@ -672,16 +743,46 @@ def _continuous_action_to_command(action: np.ndarray, obs: dict[str, Any], cfg: 
 	if action.size < 3:
 		action = np.pad(action, (0, 3 - action.size), mode="constant")
 	# 很小的输出视为静止，避免在中心附近抖动时持续把准星往下拉。
-	if abs(float(action[0])) < 0.08:
+	deadzone = 0.01
+	if abs(float(action[0])) < deadzone:
 		action[0] = 0.0
-	if abs(float(action[1])) < 0.08:
+	if abs(float(action[1])) < deadzone:
 		action[1] = 0.0
+	# 如果启用比例控制（更简单直接）：忽略 actor 的横纵输出，直接根据观测的 target_dx/target_dy 线性映射到像素位移
+	visible = bool(obs.get("target_visible", obs.get("enemy_visible", False)))
+	if getattr(cfg, "use_proportional_control", False) and visible:
+		tx = float(obs.get("target_dx", 0.0))
+		ty = float(obs.get("target_dy", 0.0))
+		# 直接线性映射到像素（tx,ty 为 -1..1）
+		px = float(tx) * cfg.move_gain
+		py = float(ty) * cfg.move_gain
+		if getattr(cfg, "invert_x", False):
+			px = -px
+		if getattr(cfg, "invert_y", False):
+			py = -py
+		move_x = int(max(-cfg.max_step, min(cfg.max_step, round(px))))
+		move_y = int(max(-cfg.max_step, min(cfg.max_step, round(py))))
+		center_error = float(obs.get("aim_error", 1.0))
+		# 当目标足够接近中心时自动开火
+		if center_error <= float(cfg.shoot_center_error):
+			return "shoot", 0, 0, True
+		if move_x == 0 and move_y == 0:
+			return "idle", 0, 0, False
+		if abs(move_x) >= abs(move_y):
+			return ("aim_right" if move_x > 0 else "aim_left"), move_x, move_y, False
+		return ("aim_down" if move_y > 0 else "aim_up"), move_x, move_y, False
 	# 压缩动作幅度：对 actor 输出做幂次缩放以减小单步位移（靠近0时更小），再乘以 move_gain
 	ax = float(action[0])
 	ay = float(action[1])
-	# 使用指数 >1 压缩绝对值（例如 1.5），在 [-1,1] 范围内抑制较大动作
-	scaled_x = (abs(ax) ** 1.8) * (1.0 if ax >= 0.0 else -1.0)
-	scaled_y = (abs(ay) ** 1.8) * (1.0 if ay >= 0.0 else -1.0)
+	# 使用指数 >1 但稍小于之前值以提升响应速度（例如 1.4），在 [-1,1] 范围内平衡抑制与响应
+	power = 1.4
+	scaled_x = (abs(ax) ** power) * (1.0 if ax >= 0.0 else -1.0)
+	scaled_y = (abs(ay) ** power) * (1.0 if ay >= 0.0 else -1.0)
+	# 支持运行时反转轴，便于调试方向问题
+	if getattr(cfg, "invert_x", False):
+		scaled_x = -float(scaled_x)
+	if getattr(cfg, "invert_y", False):
+		scaled_y = -float(scaled_y)
 	move_x = int(max(-cfg.max_step, min(cfg.max_step, round(float(scaled_x) * cfg.move_gain))))
 	move_y = int(max(-cfg.max_step, min(cfg.max_step, round(float(scaled_y) * cfg.move_gain))))
 	shoot_score = float(action[2])
@@ -701,9 +802,142 @@ def _should_update_on_obs(obs: dict[str, Any]) -> bool:
 	return bool(obs.get("target_visible", obs.get("enemy_visible", False)))
 
 
-def _build_llm_kill_counter(shared_frame_path: str) -> Any | None:
-	qwen_api_key = get_resolve_qwen_api_key("")
+def _try_measure_stream_delay(env: Any, controller: Any, cfg: TrainConfig) -> float | None:
+	"""训练前测量视频流延迟：以鼠标大幅移动到点位大幅变化的耗时作为估计。"""
+	if not isinstance(env, SharedPointEnv) or controller is None:
+		return None
+
+	delays: list[float] = []
+	for trial_idx in range(max(1, int(cfg.delay_measure_trials))):
+		visible_obs: dict[str, Any] | None = None
+		wait_deadline = time.monotonic() + 6.0
+		while time.monotonic() < wait_deadline:
+			obs = env.get_observation()
+			if _should_update_on_obs(obs):
+				visible_obs = obs
+				break
+			time.sleep(max(0.01, cfg.delay_measure_poll_sec))
+
+		if visible_obs is None:
+			continue
+
+		base_dx = float(visible_obs.get("target_dx", 0.0))
+		base_dy = float(visible_obs.get("target_dy", 0.0))
+		t0 = time.monotonic()
+		move_px = int(max(30, cfg.delay_measure_move_px))
+		controller.mouse_move(move_px, 0)
+
+		detected_delay: float | None = None
+		measure_deadline = t0 + max(0.5, float(cfg.delay_measure_timeout_sec))
+		while time.monotonic() < measure_deadline:
+			obs = env.get_observation()
+			if _should_update_on_obs(obs):
+				dx = float(obs.get("target_dx", 0.0))
+				dy = float(obs.get("target_dy", 0.0))
+				shift = ((dx - base_dx) ** 2 + (dy - base_dy) ** 2) ** 0.5
+				if shift >= float(cfg.delay_measure_min_shift):
+					detected_delay = time.monotonic() - t0
+					break
+			time.sleep(max(0.01, cfg.delay_measure_poll_sec))
+
+		# 粗略回中，避免连续测量把视角越拉越偏。
+		controller.mouse_move(-move_px, 0)
+		time.sleep(0.08)
+
+		if detected_delay is not None:
+			delays.append(float(detected_delay))
+			print(f"[train] delay_measure trial={trial_idx + 1} delay_sec={detected_delay:.3f}", flush=True)
+
+	if not delays:
+		return None
+
+	delays.sort()
+	median_delay = float(delays[len(delays) // 2])
+	measured = max(0.05, min(3.0, median_delay))
+	env.stream_delay_sec = float(measured)
+	return measured
+
+
+def _auto_detect_axis_inversion(env: Any, controller: Any, cfg: TrainConfig) -> tuple[bool, bool] | None:
+	"""自动检测鼠标横/纵轴方向是否需要反转。
+
+	方法：对可见目标分别做小幅正向像素移动，检测归一化的 target_dx/target_dy 的变化方向。
+	如果移动为正但观测到的 target_dx/dy 反向变化（符号相反），则认为该轴需要反转。
+	返回 (invert_x, invert_y) 或 None（检测失败）。
+	"""
+	if not isinstance(env, SharedPointEnv) or controller is None:
+		return None
+
+	try:
+		wait_deadline = time.monotonic() + 4.0
+		visible_obs = None
+		while time.monotonic() < wait_deadline:
+			obs = env.get_observation()
+			if _should_update_on_obs(obs):
+				visible_obs = obs
+				break
+			time.sleep(max(0.01, cfg.delay_measure_poll_sec))
+		if visible_obs is None:
+			return None
+
+		base_dx = float(visible_obs.get("target_dx", 0.0))
+		base_dy = float(visible_obs.get("target_dy", 0.0))
+
+		move_px = int(max(20, min(200, cfg.delay_measure_move_px // 3)))
+		# 横轴检测：向右移动 move_px
+		t0 = time.monotonic()
+		controller.mouse_move(move_px, 0)
+		detected_dx = None
+		deadline = t0 + 1.0
+		while time.monotonic() < deadline:
+			obs2 = env.get_observation()
+			if _should_update_on_obs(obs2):
+				dx2 = float(obs2.get("target_dx", 0.0))
+				if abs(dx2 - base_dx) >= float(cfg.delay_measure_min_shift) * 0.25:
+					detected_dx = dx2 - base_dx
+					break
+			time.sleep(max(0.01, cfg.delay_measure_poll_sec))
+		# 回中
+		controller.mouse_move(-move_px, 0)
+		time.sleep(0.06)
+
+		# 纵轴检测：向下移动 move_px
+		t0 = time.monotonic()
+		controller.mouse_move(0, move_px)
+		detected_dy = None
+		deadline = t0 + 1.0
+		while time.monotonic() < deadline:
+			obs3 = env.get_observation()
+			if _should_update_on_obs(obs3):
+				dy3 = float(obs3.get("target_dy", 0.0))
+				if abs(dy3 - base_dy) >= float(cfg.delay_measure_min_shift) * 0.25:
+					detected_dy = dy3 - base_dy
+					break
+			time.sleep(max(0.01, cfg.delay_measure_poll_sec))
+		controller.mouse_move(0, -move_px)
+		time.sleep(0.06)
+
+		invert_x = False
+		invert_y = False
+		if detected_dx is not None:
+			# 如果向右移动但 target_dx 变小（负），说明方向相反
+			if float(detected_dx) < 0.0:
+				invert_x = True
+		if detected_dy is not None:
+			# 如果向下移动但 target_dy 变小（负），说明方向相反
+			if float(detected_dy) < 0.0:
+				invert_y = True
+
+		print(f"[train] auto_detect_axis -> invert_x={invert_x} invert_y={invert_y}", flush=True)
+		return (invert_x, invert_y)
+	except Exception:
+		return None
+
+
+def _build_llm_kill_counter(shared_frame_path: str, explicit_api_key: str = "") -> Any | None:
+	qwen_api_key = get_resolve_qwen_api_key(explicit_api_key)
 	if not qwen_api_key:
+		print("[train] LLM kill counter=disabled (missing API key)", flush=True)
 		return None
 	try:
 		cv2 = importlib.import_module("cv2")
@@ -712,6 +946,7 @@ def _build_llm_kill_counter(shared_frame_path: str) -> Any | None:
 	try:
 		qwen_client = get_qwen_location_client(api_key=qwen_api_key, model="qwen3.6-plus")
 	except Exception:
+		print("[train] LLM kill counter=disabled (qwen client init failed)", flush=True)
 		return None
 
 	def _query(prev_obs: dict[str, Any], curr_obs: dict[str, Any], action_name: str, manager_goal: str) -> dict[str, Any]:
@@ -753,7 +988,24 @@ def train_loop(cfg: TrainConfig) -> None:
 	best_episode_idx = 0
 	best_reward_kpm = 0.0
 	controller = m_actions() if (cfg.apply_actions or cfg.env_mode != "smoke") else None
-	llm_kill_counter = _build_llm_kill_counter(cfg.shared_frame_path) if cfg.env_mode != "smoke" else None
+	llm_kill_counter = _build_llm_kill_counter(cfg.shared_frame_path, cfg.qwen_api_key) if cfg.env_mode != "smoke" else None
+	# 自动检测轴方向（左右/上下是否需反转）并应用到 cfg
+	if isinstance(env, SharedPointEnv) and controller is not None and cfg.env_mode != "smoke":
+		detected = _auto_detect_axis_inversion(env, controller, cfg)
+		if isinstance(detected, tuple) and len(detected) == 2:
+			cfg.invert_x, cfg.invert_y = bool(detected[0]), bool(detected[1])
+
+	if cfg.auto_measure_stream_delay and isinstance(env, SharedPointEnv) and controller is not None and cfg.env_mode != "smoke":
+		measured_delay = _try_measure_stream_delay(env, controller, cfg)
+		if measured_delay is not None:
+			cfg.stream_delay_sec = float(measured_delay)
+			print(f"[train] stream_delay_sec auto-measured: {cfg.stream_delay_sec:.3f}", flush=True)
+		else:
+			print(f"[train] stream_delay_sec auto-measure failed, keep configured value: {cfg.stream_delay_sec:.3f}", flush=True)
+	feedback_delay_steps = 1
+	if isinstance(env, SharedPointEnv):
+		feedback_delay_steps = max(1, int(round(cfg.stream_delay_sec / max(0.001, float(cfg.step_dt_sec)))))
+		print(f"[train] feedback_delay_steps={feedback_delay_steps} (stream_delay_sec={cfg.stream_delay_sec:.3f}, step_dt_sec={cfg.step_dt_sec:.3f})", flush=True)
 	stop_requested = False
 	checkpoint_path = str(cfg.load_path or cfg.save_path)
 	loaded_agent: TD3Agent | None = None
@@ -825,6 +1077,8 @@ def train_loop(cfg: TrainConfig) -> None:
 			obs = env.reset()
 			goal = "search"
 			kill_count_state = {"last_kill_count": 0}
+			pending_transitions: list[dict[str, Any]] = []
+			last_no_target_search_move_t = 0.0
 			ep_reward = 0.0
 			ep_base_reward = 0.0
 			ep_hit = 0.0
@@ -837,9 +1091,20 @@ def train_loop(cfg: TrainConfig) -> None:
 					break
 
 				if not _should_update_on_obs(obs):
-					time.sleep(cfg.step_dt_sec)
-					obs, _ = env.step("idle", goal)
+					now = time.monotonic()
+					if last_no_target_search_move_t <= 0.0:
+						last_no_target_search_move_t = now - cfg.no_target_search_interval_sec
+					if (now - last_no_target_search_move_t) >= cfg.no_target_search_interval_sec:
+						search_radius = int(max(0, cfg.no_target_search_step))
+						if search_radius > 0:
+							recover_dx = random.randint(-search_radius, search_radius)
+							recover_dy = random.randint(-search_radius, search_radius)
+							if controller is not None and cfg.env_mode != "smoke":
+								controller.mouse_move(recover_dx, recover_dy)
+						last_no_target_search_move_t = now
+					obs, _ = env.step("aim_up", goal)
 					continue
+				last_no_target_search_move_t = 0.0
 
 				maybe_goal = get_manager_goal(obs, step_idx, cfg.manager_interval)
 				if maybe_goal:
@@ -863,35 +1128,78 @@ def train_loop(cfg: TrainConfig) -> None:
 						controller.mouse_click(hold_sec=0.03)
 
 				next_obs, done = env.step(action_name, goal)
-				reward, _reward_items = get_reward(
-					worker_obs,
-					next_obs,
-					action_name,
-					goal,
-					kill_count_reader=llm_kill_counter,
-					kill_count_state=kill_count_state,
+
+				pending_transitions.append(
+					{
+						"worker_obs": worker_obs,
+						"state": state,
+						"action": action,
+						"action_name": action_name,
+						"goal": goal,
+					}
 				)
-				ep_reward += reward
-				ep_base_reward += reward
-				ep_hit += float(next_obs.get("hit", 0.0))
-				ep_kill += float(_reward_items.get("llm_kill_delta", _reward_items.get("kill", 0.0)))
-				ep_death += float(next_obs.get("death", 0.0))
 
-				next_enemy_feedback = get_enemy_feedback(next_obs)
-				next_worker_obs = dict(next_obs)
-				next_worker_obs.update(next_enemy_feedback)
-				next_state = _build_td3_state(next_worker_obs, goal)
-				done_float = 1.0 if done else 0.0
-				replay_buffer.add(state, action, reward, next_state, done_float)
+				if len(pending_transitions) >= max(1, feedback_delay_steps):
+					ready = pending_transitions.pop(0)
+					reward, _reward_items = get_reward(
+						ready["worker_obs"],
+						next_obs,
+						str(ready["action_name"]),
+						str(ready["goal"]),
+						kill_count_reader=llm_kill_counter,
+						kill_count_state=kill_count_state,
+					)
+					ep_reward += reward
+					ep_base_reward += reward
+					ep_hit += float(next_obs.get("hit", 0.0))
+					ep_kill += float(_reward_items.get("llm_kill_delta", _reward_items.get("kill", 0.0)))
+					ep_death += float(next_obs.get("death", 0.0))
 
-				if replay_buffer.size >= max(1, cfg.start_steps):
-					for _ in range(max(1, cfg.updates_per_step)):
-						train_stats = agent.train_step(replay_buffer, cfg.batch_size)
-						ep_updates += 1
+					next_enemy_feedback = get_enemy_feedback(next_obs)
+					next_worker_obs = dict(next_obs)
+					next_worker_obs.update(next_enemy_feedback)
+					next_state = _build_td3_state(next_worker_obs, str(ready["goal"]))
+					done_float = 1.0 if done else 0.0
+					replay_buffer.add(ready["state"], ready["action"], reward, next_state, done_float)
+
+					if replay_buffer.size >= max(1, cfg.start_steps):
+						for _ in range(max(1, cfg.updates_per_step)):
+							train_stats = agent.train_step(replay_buffer, cfg.batch_size)
+							ep_updates += 1
 
 				obs = next_obs
 				if done:
 					break
+
+			# 用最后观测为未结算动作补齐训练样本，避免动作被丢弃。
+			if pending_transitions:
+				terminal_done = bool(obs.get("kill", 0.0) > 0.5 or obs.get("death", 0.0) > 0.5)
+				for idx, ready in enumerate(pending_transitions):
+					reward, _reward_items = get_reward(
+						ready["worker_obs"],
+						obs,
+						str(ready["action_name"]),
+						str(ready["goal"]),
+						kill_count_reader=llm_kill_counter,
+						kill_count_state=kill_count_state,
+					)
+					ep_reward += reward
+					ep_base_reward += reward
+					ep_hit += float(obs.get("hit", 0.0))
+					ep_kill += float(_reward_items.get("llm_kill_delta", _reward_items.get("kill", 0.0)))
+					ep_death += float(obs.get("death", 0.0))
+
+					next_enemy_feedback = get_enemy_feedback(obs)
+					next_worker_obs = dict(obs)
+					next_worker_obs.update(next_enemy_feedback)
+					next_state = _build_td3_state(next_worker_obs, str(ready["goal"]))
+					done_float = 1.0 if (terminal_done and idx == len(pending_transitions) - 1) else 0.0
+					replay_buffer.add(ready["state"], ready["action"], reward, next_state, done_float)
+
+					if replay_buffer.size >= max(1, cfg.start_steps):
+						for _ in range(max(1, cfg.updates_per_step)):
+							train_stats = agent.train_step(replay_buffer, cfg.batch_size)
+							ep_updates += 1
 
 			if controller is not None:
 				controller.stop()

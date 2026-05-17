@@ -10,6 +10,13 @@ MAX_STEPS="${MAX_STEPS:-200}"
 MANAGER_INTERVAL="${MANAGER_INTERVAL:-10}"
 TARGET_DISAPPEAR_SEC="${TARGET_DISAPPEAR_SEC:-1.5}"
 STEP_DT_SEC="${STEP_DT_SEC:-0.03}"
+STREAM_DELAY_SEC="${STREAM_DELAY_SEC:-1.0}"
+AUTO_MEASURE_STREAM_DELAY="${AUTO_MEASURE_STREAM_DELAY:-1}"
+DELAY_MEASURE_TRIALS="${DELAY_MEASURE_TRIALS:-3}"
+DELAY_MEASURE_MOVE_PX="${DELAY_MEASURE_MOVE_PX:-220}"
+DELAY_MEASURE_MIN_SHIFT="${DELAY_MEASURE_MIN_SHIFT:-0.06}"
+DELAY_MEASURE_TIMEOUT_SEC="${DELAY_MEASURE_TIMEOUT_SEC:-3.0}"
+DELAY_MEASURE_POLL_SEC="${DELAY_MEASURE_POLL_SEC:-0.03}"
 GAMMA="${GAMMA:-0.99}"
 SAVE_PATH="${SAVE_PATH:-${MODEL_PATH:-$ROOT_DIR/td3_checkpoint.pt}}"
 LOAD_PATH="${LOAD_PATH:-$SAVE_PATH}"
@@ -19,8 +26,8 @@ BEST_SAVE_PATH="${BEST_SAVE_PATH:-}"
 REWARD_PLOT_PATH="${REWARD_PLOT_PATH:-reward_curve.png}"
 BEST_REWARD_PLOT_PATH="${BEST_REWARD_PLOT_PATH:-}"
 REWARD_PLOT_EVERY="${REWARD_PLOT_EVERY:-100}"
-MOVE_GAIN="${MOVE_GAIN:-1000.0}"
-MAX_STEP="${MAX_STEP:-1000}"
+MOVE_GAIN="${MOVE_GAIN:-120.0}"
+MAX_STEP="${MAX_STEP:-160}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 REPLAY_SIZE="${REPLAY_SIZE:-50000}"
 START_STEPS="${START_STEPS:-400}"
@@ -31,8 +38,11 @@ POLICY_DELAY="${POLICY_DELAY:-2}"
 TAU="${TAU:-0.005}"
 EXPLORATION_NOISE="${EXPLORATION_NOISE:-0.15}"
 SHOOT_THRESHOLD="${SHOOT_THRESHOLD:-0.35}"
-SHOOT_CENTER_ERROR="${SHOOT_CENTER_ERROR:-0.055}"
+SHOOT_CENTER_ERROR="${SHOOT_CENTER_ERROR:-0.02}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10}"
+NO_TARGET_SEARCH_STEP="${NO_TARGET_SEARCH_STEP:-16}"
+NO_TARGET_SEARCH_INTERVAL_SEC="${NO_TARGET_SEARCH_INTERVAL_SEC:-1.0}"
+QWEN_API_KEY_ARG="${QWEN_API_KEY_ARG:-}"
 SHARED_FRAME_PATH="${SHARED_FRAME_PATH:-${CSRL_SHARED_FRAME_PATH:-/tmp/cs_rl_latest_frame.jpg}}"
 SHARED_STATE_PATH="${SHARED_STATE_PATH:-${CSRL_SHARED_STATE_PATH:-/tmp/cs_rl_runtime_state.json}}"
 
@@ -51,6 +61,12 @@ CMD=(
   --shared-frame-path "$SHARED_FRAME_PATH"
   --target-disappear-sec "$TARGET_DISAPPEAR_SEC"
   --step-dt-sec "$STEP_DT_SEC"
+  --stream-delay-sec "$STREAM_DELAY_SEC"
+  --delay-measure-trials "$DELAY_MEASURE_TRIALS"
+  --delay-measure-move-px "$DELAY_MEASURE_MOVE_PX"
+  --delay-measure-min-shift "$DELAY_MEASURE_MIN_SHIFT"
+  --delay-measure-timeout-sec "$DELAY_MEASURE_TIMEOUT_SEC"
+  --delay-measure-poll-sec "$DELAY_MEASURE_POLL_SEC"
   --gamma "$GAMMA"
   --save-path "$SAVE_PATH"
   --best-save-path "$BEST_SAVE_PATH"
@@ -71,7 +87,19 @@ CMD=(
   --shoot-threshold "$SHOOT_THRESHOLD"
   --shoot-center-error "$SHOOT_CENTER_ERROR"
   --checkpoint-every "$CHECKPOINT_EVERY"
+  --no-target-search-step "$NO_TARGET_SEARCH_STEP"
+  --no-target-search-interval-sec "$NO_TARGET_SEARCH_INTERVAL_SEC"
 )
+
+if [[ -n "$QWEN_API_KEY_ARG" ]]; then
+  CMD+=(--qwen-api-key "$QWEN_API_KEY_ARG")
+fi
+
+if [[ "$AUTO_MEASURE_STREAM_DELAY" == "1" || "$AUTO_MEASURE_STREAM_DELAY" == "true" || "$AUTO_MEASURE_STREAM_DELAY" == "TRUE" ]]; then
+  CMD+=(--auto-measure-stream-delay)
+else
+  CMD+=(--no-auto-measure-stream-delay)
+fi
 
 if [[ "$RESUME" == "1" || "$RESUME" == "true" || "$RESUME" == "TRUE" ]]; then
   CMD+=(--resume)
@@ -101,7 +129,17 @@ echo "[trainsl] batch_size: $BATCH_SIZE replay_size: $REPLAY_SIZE start_steps: $
 echo "[trainsl] updates_per_step: $UPDATES_PER_STEP policy_noise: $POLICY_NOISE noise_clip: $NOISE_CLIP policy_delay: $POLICY_DELAY"
 echo "[trainsl] tau: $TAU exploration_noise: $EXPLORATION_NOISE"
 echo "[trainsl] shoot_threshold: $SHOOT_THRESHOLD shoot_center_error: $SHOOT_CENTER_ERROR checkpoint_every: $CHECKPOINT_EVERY"
+echo "[trainsl] no_target_search_step: $NO_TARGET_SEARCH_STEP no_target_search_interval_sec: $NO_TARGET_SEARCH_INTERVAL_SEC"
+if [[ -n "$QWEN_API_KEY_ARG" ]]; then
+  echo "[trainsl] qwen_api_key: explicit arg provided"
+elif [[ -n "${DASHSCOPE_API_KEY:-}${QWEN_API_KEY:-}${OPENAI_API_KEY:-}" ]]; then
+  echo "[trainsl] qwen_api_key: from environment"
+else
+  echo "[trainsl] qwen_api_key: missing (LLM kill counter will be disabled)"
+fi
 echo "[trainsl] 模式: $ENV_MODE"
+echo "[trainsl] stream_delay_sec: $STREAM_DELAY_SEC"
+echo "[trainsl] auto_measure_stream_delay: $AUTO_MEASURE_STREAM_DELAY trials=$DELAY_MEASURE_TRIALS move_px=$DELAY_MEASURE_MOVE_PX min_shift=$DELAY_MEASURE_MIN_SHIFT timeout_sec=$DELAY_MEASURE_TIMEOUT_SEC poll_sec=$DELAY_MEASURE_POLL_SEC"
 echo "[trainsl] 说明: 按 Ctrl+C 可中断并保存当前模型，重新运行时可继续训练。"
 
 exec "${CMD[@]}"
