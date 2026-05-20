@@ -351,7 +351,7 @@ namespace KE {
         [DllImport("user32.dll", SetLastError=true)]
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll", SetLastError=true)]
-        public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
+        public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
     }
