@@ -126,3 +126,55 @@ bash crop_images.sh
 - 强化学习测试：test.py
 - 视觉训练：visual_recognition/train.py
 - 视觉推理：visual_recognition/predict.py
+
+## 实时决策与辅助（Advisor）
+
+- 主入口：`decision_advisor.py`，用于读取 `visual_recognition` 的共享状态（YOLO centers 等），并在无敌人时异步询问 LLM 给出策略，或在见到人时使用本地瞄准模型快速瞄准并开火。
+- 常用参数示例：
+
+```bash
+# 使用本地瞄准模型打印调试信息（需激活 conda 环境 condacommon）
+conda activate condacommon
+python decision_advisor.py --debug-aim --aim-model-path point_aim_net_resume_best.pt
+
+# 启用 API Key 调用大模型（Qwen/OpenAI 等）并在空闲时自动询问
+python decision_advisor.py --api-key YOUR_KEY --auto-idle-query-sec 3.0
+```
+
+## 瞄准模型（Point Aim）
+
+- 模型训练/加载：`point_aim_trainer.py` 提供 `load_model`，仓库包含若干模型权重（如 `point_aim_net_resume_best.pt`、`point_aim_net.pt` 等）。
+- 在 `decision_advisor.py` 中会以优先级使用本地瞄准模型（如果可用），以降低对 LLM 的实时依赖。
+
+## 控制接口
+
+- `actions.py` 提供高层动作映射（按键/鼠标）；`control.py` 提供底层键盘/鼠标发送实现（socket client）。
+- 常用函数：`m_actions().mouse_click_interval()`、`m_actions().mouse_move()`、`m_actions().stop()` 等。
+
+## 常用脚本
+
+- `run.sh`：启动游戏推流（WSL+Windows 配合）。
+- `start_realtime.sh`：一键启动视觉实时管道（`visual_recognition/realtime_pipeline.py` + ffplay）。
+- `yolo_ffplay.sh`, `yolorun.sh`：YOLO 预览与推流脚本。
+- `decision_advisor.sh`：封装运行 `decision_advisor.py` 的脚本（可查看用于调试的默认参数）。
+
+## 运行与调试小贴士
+
+- 推荐在 `condacommon` 环境下运行：
+
+```bash
+conda activate condacommon
+pip install -r requirements.txt
+```
+
+- 若需要调试瞄准行为，使用 `--debug-aim` 来打印模型输入/输出与开火触发信息。
+- 若要强制只使用本地瞄准并跳过 LLM，请不要提供 `--api-key`，advisor 会在检测到人物时直接进入瞄准模式。
+
+## 模型与输出目录
+
+- YOLO 训练/输出位于 `visual_recognition/runs/`，模型权重存放在 `visual_recognition/runs/*/weights/`。
+- 截图目录：`screenshots/`，裁剪后图片：`screenshots_crop/`。
+
+---
+
+如果需要我把 README 再精简为一页快速参考，或把运行示例分成 Windows/WSL 两部分，我可以继续调整。

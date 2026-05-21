@@ -57,6 +57,10 @@ ACTION_CODE_TO_KEY = {
 ACTION_CODE_TO_NAME["F"] = "蹲下"
 ACTION_CODE_TO_KEY["F"] = "ctrl"
 
+# 新增前行动作 G -> w
+ACTION_CODE_TO_NAME["G"] = "前行"
+ACTION_CODE_TO_KEY["G"] = "w"
+
 ACTION_CODE_TO_MOUSE_DX = {
     "B": 1000,
     "C": -1000,
@@ -147,6 +151,36 @@ def simplify_action_code(action_code: str) -> str:
     return "+".join(keep)
 
 
+def enforce_llm_allowed_actions(action_code: str) -> str:
+    """对 LLM 返回的动作施行策略：优先允许 `G`(前行) 和 `B`/`C`(右转/左转)。
+
+    规则：
+    - 尽量只保留 `G`，或 `G`+(`B` 或 `C`)，或 单独的 `B`/`C`。
+    - 移除 `A`/`D`（左右平移）、`E`/`F`（跳/蹲）等，除非没有任何允许动作可用，则回退到简化后的第一个动作。
+    """
+    # 强制策略：最终结果必须包含 G（前行），并且可选包含一个转向 B 或 C（只保留第一个遇到的）
+    parts = [p.strip().upper() for p in str(action_code or "").split("+") if p.strip()]
+
+    # 总是包含 G
+    result: list[str] = ["G"]
+
+    # 选择第一个出现的转向（B 或 C），只保留一个
+    for p in parts:
+        if p in ("B", "C"):
+            result.append(p)
+            break
+
+    # 去重并保持顺序（G 应该在前）
+    seen = set()
+    out: list[str] = []
+    for p in result:
+        if p not in seen and p in ACTION_CODE_TO_NAME:
+            seen.add(p)
+            out.append(p)
+
+    return "+".join(out)
+
+
 def execute_action_choice(action_code: str, controller: m_actions, hold_sec: float = 0.12) -> str:
     keys = get_action_keys(action_code)
     mouse_dx = get_action_mouse_dx(action_code)
@@ -171,14 +205,18 @@ def get_query_next_action_with_choice(qwen_client, summary_text: str, image_data
                         "type": "text",
                         "text": (
                             "你是CS战术助手。请同时输出下一步建议和动作选择。\n"
-                            "可选动作只有以下 5 个字母：\n"
+                            "可选动作只有以下 6 个字母：\n"
                             "A=左平移（A键）\n"
                             "B=右转（鼠标x=+1000）\n"
                             "C=左转（鼠标x=-1000）\n"
                             "D=右平移（D键）\n"
                             "E=跳跃\n"
                             "F=蹲下（Ctrl键）\n"
-                            "你可以选择单个动作，也可以选择多个动作组合；组合时用 + 连接，顺序按 A/B/C/D/E/F。\n"
+                            "G=前行（W键）\n"
+                            "你可以选择单个动作，也可以选择多个动作组合；组合时用 + 连接，顺序按 A/B/C/D/E/F/G。\n"
+                            "在可行时，优先只使用 G(前行)、B(右转)、C(左转)。\n"
+                            "除非有充分理由（请在 suggestion 中说明），否则不要返回 A/D/E/F 等其他动作。\n"
+                            "如果返回了其他动作，系统会自动优先保留 G/B/C（必要时保留单个其它动作）。\n"
                             "如果当前不需要动作，可将 action 置空字符串。\n"
                             "只输出 JSON，不要输出额外解释，格式必须是：\n"
                             '{"suggestion":"一句话建议","action":"A+B"}\n'
@@ -729,10 +767,11 @@ def main() -> int:
                 mode = item.get("mode") or "auto"
                 context = item.get("context") or {}
 
-                # 简化动作并应用（主线程执行）
+                # 简化动作并应用（主线程执行），并强制 LLM 策略（优先 G/B/C）
                 raw_code = str(res.get("action_code") or "")
                 simple_code = simplify_action_code(raw_code)
-                res["action_code"] = simple_code
+                enforced = enforce_llm_allowed_actions(simple_code)
+                res["action_code"] = enforced
                 action_text = res.get("suggestion") or "建议继续观察、微调视角并保持掩体"
 
                 new_keys = set(get_action_keys(str(res.get("action_code") or "")))
