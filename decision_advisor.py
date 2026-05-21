@@ -12,6 +12,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 import numpy as np
@@ -95,6 +96,55 @@ def get_action_mouse_dx(action_code: str) -> int:
     for part in str(action_code or "").upper().replace(" ", "").split("+"):
         mouse_dx += int(ACTION_CODE_TO_MOUSE_DX.get(part, 0))
     return mouse_dx
+
+
+def simplify_action_code(action_code: str) -> str:
+    """如果模型返回组合动作，尽量简化并移除冲突方向。
+
+    规则：
+    - 保留顺序中的第一个有效动作为主动作。
+    - 左/右平移（A/D）最多保留其一（优先出现者）。
+    - 左转/右转（C/B）最多保留其一（优先出现者）。
+    - 跳跃（E）与蹲下（F）可保留，但不会与相反方向共同出现冲突。
+    - 最终结果尽量只包含 1 个动作；在非冲突情况下最多保留 2 个动作（例如移动+跳跃）。
+    """
+    if not action_code:
+        return ""
+    parts = [p.strip().upper() for p in str(action_code).split("+") if p.strip()]
+    if not parts:
+        return ""
+
+    keep: list[str] = []
+    seen_move = None  # 'A' or 'D'
+    seen_turn = None  # 'B' or 'C'
+
+    for p in parts:
+        if p == "A" or p == "D":
+            if seen_move is None:
+                seen_move = p
+                keep.append(p)
+            else:
+                # 已有移动方向，跳过冲突的另一侧
+                continue
+        elif p == "B" or p == "C":
+            if seen_turn is None:
+                seen_turn = p
+                keep.append(p)
+            else:
+                continue
+        elif p == "E" or p == "F":
+            # 跳跃/蹲下可以作为附加动作，但不要产生重复
+            if p not in keep:
+                keep.append(p)
+        else:
+            # 非识别动作，忽略
+            continue
+
+        # 限制输出：尽量只保留一个主动作，允许一个次动作（非冲突）
+        if len(keep) >= 2:
+            break
+
+    return "+".join(keep)
 
 
 def execute_action_choice(action_code: str, controller: m_actions, hold_sec: float = 0.12) -> str:
@@ -356,6 +406,87 @@ def get_start_stdin_thread(cmd_queue: "queue.Queue[str]") -> threading.Thread:
     return t
 
 
+# 跟踪正在进行的 LLM 查询，便于在检测到人物时立即标记为取消
+inflight_llm_lock = threading.Lock()
+inflight_llm_state: dict = {"id": None, "canceled": False}
+
+
+def perform_llm_query_with_inflight(qwen_client, summary: str, image_data_url: str):
+    # Deprecated synchronous wrapper - keep for compatibility
+    lid = uuid.uuid4().hex
+    with inflight_llm_lock:
+        inflight_llm_state["id"] = lid
+        inflight_llm_state["canceled"] = False
+    try:
+        res = get_query_next_action_with_choice(qwen_client, summary, image_data_url)
+        return lid, res
+    except Exception as exc:
+        return lid, {"suggestion": f"error:{type(exc).__name__}", "action_code": ""}
+
+
+def start_llm_query_async(qwen_client, summary: str, image_data_url: str, *, mode: str = "auto", context: dict | None = None, result_queue: "queue.Queue" | None = None):
+    """Start a background thread to call LLM and apply result if not canceled.
+
+    mode: 'pos' or 'auto' used to decide how to apply the result and which prints to emit.
+    context: extra info (e.g., location_text, ocr_text) used for printing in pos mode.
+    """
+    if qwen_client is None:
+        return None
+    lid = uuid.uuid4().hex
+
+    def _worker():
+        with inflight_llm_lock:
+            inflight_llm_state["id"] = lid
+            inflight_llm_state["canceled"] = False
+        try:
+            res = get_query_next_action_with_choice(qwen_client, summary, image_data_url)
+        except Exception as exc:
+            res = {"suggestion": f"error:{type(exc).__name__}", "action_code": ""}
+
+        canceled = False
+        with inflight_llm_lock:
+            if inflight_llm_state.get("id") == lid and inflight_llm_state.get("canceled"):
+                canceled = True
+                inflight_llm_state["id"] = None
+
+        if canceled:
+            # do not apply result
+            if mode == "pos":
+                print("[advisor] LLM 查询在进行中被中断（检测到人物），已结束本次询问", flush=True)
+            else:
+                print("[advisor] 自动 LLM 查询被中断（检测到人物），跳过本次自动建议", flush=True)
+            return
+
+        # 将结果发回主线程处理，避免在子线程直接操作控制器或 held_keys
+        if result_queue is not None:
+            try:
+                result_queue.put_nowait({"res": res, "mode": mode, "context": context or {}})
+            except Exception:
+                pass
+        else:
+            # 如果没有提供队列，则在子线程打印结果（退化行为）
+            try:
+                raw_code = str(res.get("action_code") or "")
+                simple_code = simplify_action_code(raw_code)
+                res["action_code"] = simple_code
+                action_text = res.get("suggestion") or "建议继续观察、微调视角并保持掩体"
+                print(f"location={(context or {}).get('location_text','unknown')}", flush=True)
+                print(f"next_action={action_text}", flush=True)
+                print(f"action_choice={res.get('action_code') or '无'}", flush=True)
+                print(f"action_label={res.get('action_label') or '无'}", flush=True)
+            except Exception:
+                pass
+
+        # 清理 inflight id
+        with inflight_llm_lock:
+            if inflight_llm_state.get("id") == lid:
+                inflight_llm_state["id"] = None
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return lid
+
+
 def get_run_ocr_and_print(
     *,
     frame,
@@ -516,6 +647,9 @@ def main() -> int:
     cmd_queue: "queue.Queue[str]" = queue.Queue()
     get_start_stdin_thread(cmd_queue)
 
+    # 队列：LLM 后台线程会把结果放到这里，由主循环在主线程处理（避免子线程直接操控控制器）
+    llm_result_queue: "queue.Queue[dict]" = queue.Queue()
+
     print("[advisor] 输入命令: ocr | pos | help | quit", flush=True)
 
     last_enemy_signature = ""
@@ -572,33 +706,12 @@ def main() -> int:
                     "截图=同一时刻原生截图；"
                     "请给出下一步建议，并同时选择动作。"
                 )
-                action_result = get_query_next_action_with_choice(qwen_client, summary, full_image_data_url)
-                action_text = action_result.get("suggestion") or "建议继续观察、微调视角并保持掩体"
-
-                # 按住新动作键，释放旧的不在新集合中的键（按键保持直到下一次询问）
-                new_keys = set(get_action_keys(str(action_result.get("action_code") or "")))
-                to_release = list(held_keys - new_keys)
-                if to_release:
-                    _key_up(to_release)
-                to_press = list(new_keys - held_keys)
-                if to_press:
-                    _key_down(to_press)
-                held_keys = new_keys
-
-                # 只执行鼠标移动部分（键盘由按下/释放管理）
-                mouse_dx = get_action_mouse_dx(str(action_result.get("action_code") or ""))
-                mouse_exec = "无"
-                if mouse_dx != 0:
-                    smooth_mouse_move(controller, mouse_dx, 0, max_step=80, delay=0.006)
-                    mouse_exec = f"mouse_dx={mouse_dx}"
-
-                executed = f"held_keys={'+'.join(sorted(held_keys))};{mouse_exec}"
-
-                print(f"location={location_text or 'unknown'}", flush=True)
-                print(f"next_action={action_text}", flush=True)
-                print(f"action_choice={action_result.get('action_code') or '无'}", flush=True)
-                print(f"action_label={action_result.get('action_label') or '无'}", flush=True)
-                print(f"action_executed={executed}", flush=True)
+                # 发起后台 LLM 查询（非阻塞），查询完成后线程会在未被取消时执行动作
+                start_llm_query_async(qwen_client, summary, full_image_data_url, mode="pos", context={
+                    "location_text": location_text,
+                    "ocr_text": ocr_text,
+                }, result_queue=llm_result_queue)
+                print("[advisor] 已异步发起 LLM 查询（pos），正在后台处理结果", flush=True)
                 continue
 
             print(f"[advisor] 未知命令: {cmd}", flush=True)
@@ -608,6 +721,49 @@ def main() -> int:
     while True:
         if handle_pending_commands():
             return 0
+        # 处理后台 LLM 返回的结果（如果有），在主线程安全地应用动作
+        try:
+            while True:
+                item = llm_result_queue.get_nowait()
+                res = item.get("res") or {}
+                mode = item.get("mode") or "auto"
+                context = item.get("context") or {}
+
+                # 简化动作并应用（主线程执行）
+                raw_code = str(res.get("action_code") or "")
+                simple_code = simplify_action_code(raw_code)
+                res["action_code"] = simple_code
+                action_text = res.get("suggestion") or "建议继续观察、微调视角并保持掩体"
+
+                new_keys = set(get_action_keys(str(res.get("action_code") or "")))
+                to_release = list(held_keys - new_keys)
+                if to_release:
+                    _key_up(to_release)
+                to_press = list(new_keys - held_keys)
+                if to_press:
+                    _key_down(to_press)
+                held_keys.clear()
+                held_keys.update(new_keys)
+
+                mouse_dx = get_action_mouse_dx(str(res.get("action_code") or ""))
+                mouse_exec = "无"
+                if mouse_dx != 0:
+                    smooth_mouse_move(controller, mouse_dx, 0, max_step=80, delay=0.006)
+                    mouse_exec = f"mouse_dx={mouse_dx}"
+
+                executed = f"held_keys={'+'.join(sorted(held_keys))};{mouse_exec}"
+
+                print(f"location={context.get('location_text','unknown')}", flush=True)
+                print(f"next_action={action_text}", flush=True)
+                print(f"action_choice={res.get('action_code') or '无'}", flush=True)
+                print(f"action_label={res.get('action_label') or '无'}", flush=True)
+                print(f"action_executed={executed}", flush=True)
+
+                if mode == "auto":
+                    last_auto_query_t = time.monotonic()
+                    auto_query_done_for_idle = True
+        except queue.Empty:
+            pass
 
         shared_frame = get_read_shared_frame(cv2, args.shared_frame_path)
         if shared_frame is not None:
@@ -619,7 +775,15 @@ def main() -> int:
         if centers:
             now_seen = time.monotonic()
             last_enemy_seen_t = now_seen
+            # 当检测到敌人时，允许在之后的空闲周期再次触发自动询问一次
             auto_query_done_for_idle = False
+            # 若有正在进行的大模型查询，立即标记为取消（从应用层面中止询问结果处理）
+            try:
+                with inflight_llm_lock:
+                    if inflight_llm_state.get("id") is not None:
+                        inflight_llm_state["canceled"] = True
+            except Exception:
+                pass
             signature = json.dumps(centers, ensure_ascii=False)
             if signature != last_enemy_signature:
                 # suppressed verbose YOLO center log
@@ -682,38 +846,8 @@ def main() -> int:
                         except Exception:
                             pass
 
-                    # 如果配置了 qwen_client，则继续调用大模型询问动作建议
-                    if qwen_client is not None:
-                        enemy_frame = latest_frame.copy()
-                        enemy_summary = (
-                            f"敌人已出现；敌人中心点={json.dumps(centers, ensure_ascii=False)}；"
-                            f"瞄准信息={json.dumps(target_payload, ensure_ascii=False) if target_payload is not None else 'none'}；"
-                            "请给出下一步建议，并同时选择动作。"
-                        )
-                        enemy_image_data_url = get_build_image_data_url_from_frame(cv2, enemy_frame, (0.0, 0.0, 1.0, 1.0))
-                        enemy_action_result = get_query_next_action_with_choice(qwen_client, enemy_summary, enemy_image_data_url)
-                        enemy_action_text = enemy_action_result.get("suggestion") or "建议停止移动，优先瞄准并开火"
-                        # 将建议动作按持有逻辑执行（鼠标单次移动）
-                        new_keys = set(get_action_keys(str(enemy_action_result.get("action_code") or "")))
-                        to_release = list(held_keys - new_keys)
-                        if to_release:
-                            _key_up(to_release)
-                        to_press = list(new_keys - held_keys)
-                        if to_press:
-                            _key_down(to_press)
-                        held_keys = new_keys
-                        mouse_dx = get_action_mouse_dx(str(enemy_action_result.get("action_code") or ""))
-                        mouse_exec = "无"
-                        if mouse_dx != 0:
-                            smooth_mouse_move(controller, mouse_dx, 0, max_step=80, delay=0.006)
-                            mouse_exec = f"mouse_dx={mouse_dx}"
-                        enemy_executed = f"held_keys={'+'.join(sorted(held_keys))};{mouse_exec}"
-                        print(f"decision=enemy_visible suggestion={enemy_action_text}", flush=True)
-                        print(f"action_choice={enemy_action_result.get('action_code') or '无'}", flush=True)
-                        print(f"action_label={enemy_action_result.get('action_label') or '无'}", flush=True)
-                        print(f"action_executed={enemy_executed}", flush=True)
-                    else:
-                        print("decision=enemy_visible suggestion=建议停止移动，优先瞄准并开火", flush=True)
+                    # 当画面检测到人物时，只执行瞄准（不再调用大模型），以降低延迟与依赖
+                    print(f"decision=enemy_visible action=aim_only aim_err={float(target_payload.get('aim_error', 0.0)):.4f}", flush=True)
                 else:
                     print("decision=enemy_visible suggestion=建议停止移动，优先瞄准并开火", flush=True)
                 last_enemy_signature = signature
@@ -723,12 +857,11 @@ def main() -> int:
         auto_cooldown_sec = max(0.5, float(args.auto_idle_query_cooldown_sec))
         no_enemy_too_long = (auto_now - last_enemy_seen_t) >= idle_sec
         cooldown_ok = (auto_now - last_auto_query_t) >= auto_cooldown_sec
-        if no_enemy_too_long and cooldown_ok and (not auto_query_done_for_idle):
+        if no_enemy_too_long and cooldown_ok:
             print(f"auto_strategy_trigger=no_enemy_{int(idle_sec)}s", flush=True)
             if latest_frame is None:
                 print("[advisor] 暂无可用帧，跳过本次自动询问", flush=True)
                 last_auto_query_t = auto_now
-                auto_query_done_for_idle = True
                 time.sleep(max(0.02, float(args.poll_interval_sec)))
                 continue
             auto_frame = latest_frame.copy()
@@ -741,7 +874,6 @@ def main() -> int:
                 print("location=unknown", flush=True)
                 print("next_action=未配置 API Key，无法查询位置与大模型建议", flush=True)
                 last_auto_query_t = auto_now
-                auto_query_done_for_idle = True
                 continue
 
             auto_location_text = qwen_client.get_query_location_from_frame(cv2, auto_frame, location_roi)
@@ -754,34 +886,18 @@ def main() -> int:
                 "截图=同一时刻原生截图；"
                 "请给出下一步建议，并同时选择动作。"
             )
-            auto_action_result = get_query_next_action_with_choice(qwen_client, auto_summary, auto_full_image_data_url)
-            auto_action_text = auto_action_result.get("suggestion") or "建议继续观察、微调视角并保持掩体"
+            # 如果已有正在进行的 LLM 查询，则跳过本次自动触发
+            with inflight_llm_lock:
+                if inflight_llm_state.get("id") is not None:
+                    # 已有查询在进行，跳过此次自动询问
+                    time.sleep(max(0.02, float(args.poll_interval_sec)))
+                    continue
 
-            new_keys = set(get_action_keys(str(auto_action_result.get("action_code") or "")))
-            to_release = list(held_keys - new_keys)
-            if to_release:
-                _key_up(to_release)
-            to_press = list(new_keys - held_keys)
-            if to_press:
-                _key_down(to_press)
-            held_keys = new_keys
-
-            mouse_dx = get_action_mouse_dx(str(auto_action_result.get("action_code") or ""))
-            mouse_exec = "无"
-            if mouse_dx != 0:
-                smooth_mouse_move(controller, mouse_dx, 0, max_step=80, delay=0.006)
-                mouse_exec = f"mouse_dx={mouse_dx}"
-
-            auto_executed = f"held_keys={'+'.join(sorted(held_keys))};{mouse_exec}"
-
-            print(f"location={auto_location_text or 'unknown'}", flush=True)
-            print(f"next_action={auto_action_text}", flush=True)
-            print(f"action_choice={auto_action_result.get('action_code') or '无'}", flush=True)
-            print(f"action_label={auto_action_result.get('action_label') or '无'}", flush=True)
-            print(f"action_executed={auto_executed}", flush=True)
+            # 发起后台自动 LLM 查询（非阻塞），主循环继续以便能实时检测敌人并切换到瞄准模式
+            start_llm_query_async(qwen_client, auto_summary, auto_full_image_data_url, mode="auto", context={"location_text": auto_location_text}, result_queue=llm_result_queue)
+            # 标记为已在本次空闲期询问，避免重复连续询问
             last_auto_query_t = auto_now
             auto_query_done_for_idle = True
-
             time.sleep(max(0.02, float(args.poll_interval_sec)))
 
     return 0
