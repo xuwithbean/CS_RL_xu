@@ -10,11 +10,12 @@ SHARED_STATE_PATH="${SHARED_STATE_PATH:-${CSRL_SHARED_STATE_PATH:-/tmp/cs_rl_run
 
 # 从已有模型继续训练：默认加载当前模型文件，也可以手动指定 LOAD_PATH。
 SAVE_PATH="${SAVE_PATH:-point_aim_net_resume.pt}"
-BEST_SAVE_PATH="${BEST_SAVE_PATH:-}"
+BEST_SAVE_PATH="${BEST_SAVE_PATH:-point_aim_net_resume_best.pt}"
 LOAD_PATH="${LOAD_PATH:-$SAVE_PATH}"
 
 # 动作控制参数
-MOVE_GAIN="${MOVE_GAIN:-300}"
+MOVE_GAIN_X="${MOVE_GAIN_X:-2500}"
+MOVE_GAIN_Y="${MOVE_GAIN_Y:-500}"
 POLL_SEC="${POLL_SEC:-0.03}"
 SHOOT_CENTER_ERROR="${SHOOT_CENTER_ERROR:-0.04}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
@@ -62,7 +63,8 @@ CMD=(
   "$PYTHON_BIN" "$TRAINER_SCRIPT"
   --shared-state "$SHARED_STATE_PATH"
   --save-path "$SAVE_PATH"
-  --move-gain "$MOVE_GAIN"
+  --move-gain-x "$MOVE_GAIN_X"
+  --move-gain-y "$MOVE_GAIN_Y"
   --poll-sec "$POLL_SEC"
   --shoot-center-error "$SHOOT_CENTER_ERROR"
   --batch-size "$BATCH_SIZE"
